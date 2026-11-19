@@ -1,19 +1,19 @@
 #!/bin/bash
-# Build a raw HFS+ image (case-sensitive, journaled) with the tree in rootfs/tree.
-# Runs on the macOS CI runner (newfs_hfs / hdiutil are native there).
+# Build a raw HFS+ image (case-sensitive) with the tree in rootfs/tree.
+# Runs on the macOS CI runner. Output: rootfs/out/root-hfs.img.gz
+# A UDRW hdiutil image is an uncompressed raw volume: usable directly as the
+# XNU ramdisk (--ramdisk) with rd=md0.
 # Usage: build-image.sh [SIZEMB] [VOLNAME]
-# Output: rootfs/out/root-hfs.img.gz
 set -euo pipefail
 cd "$(dirname "$0")"
 SIZEMB="${1:-24}"
 VOL="${2:-iOSRoot}"
-
-rm -rf out build; mkdir -p out build mnt
 IMG="$PWD/build/root-hfs.img"
 
-dd if=/dev/zero of="$IMG" bs=1m count="$SIZEMB"
-newfs_hfs -s -J -v "$VOL" "$IMG"
-hdiutil attach -imagekey diskimage-class=CRawDiskImage "$IMG" -mountpoint "$PWD/mnt" -nobrowse
+rm -rf out build mnt; mkdir -p out build mnt
+hdiutil create -size "${SIZEMB}m" -fs "Case-sensitive HFS+" -volname "$VOL" \
+    -format UDRW -nospotlight "$IMG"
+hdiutil attach "$IMG" -mountpoint "$PWD/mnt" -nobrowse
 rsync -aH "$PWD/tree/" "$PWD/mnt/"
 sudo chown -R 0:0 "$PWD/mnt/"
 sync
