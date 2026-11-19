@@ -1,0 +1,29 @@
+name: rootfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      size:
+        description: volume size (hdiutil syntax, e.g. 64m / 4g)
+        default: "64m"
+  push:
+    branches: [mt6983]
+    paths:
+      - "rootfs/**"
+      - ".github/workflows/rootfs.yml"
+
+jobs:
+  image:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build HFS+ image
+        run: |
+          brew install rsync 2>/dev/null || true
+          bash rootfs/build-image.sh "${{ inputs.size || '64m' }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-hfs
+          path: rootfs/out/root-hfs.img.gz
+          retention-days: 14
