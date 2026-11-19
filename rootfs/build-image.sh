@@ -17,7 +17,8 @@ rm -rf out build mnt; mkdir -p out build mnt
 hdiutil create -size "${SIZEMB}m" -fs "Case-sensitive HFS+" -volname "$VOL" \
     -nospotlight "$DMG"
 
-INFO=$(hdiutil attach -nomount "$DMG")
+# Newer hdiutil escapes the slashes in device paths (\/dev\/disk5s1).
+INFO=$(hdiutil attach -nomount "$DMG" | sed 's|\||g')
 echo "$INFO"
 WHOLE=$(echo "$INFO" | awk '/^\/dev\/disk/ {print $1}' | head -1)
 SLICE=$(echo "$INFO" | awk '/^\/dev\/disk/ && /s[0-9]+/ {print $1}' | tail -1)
@@ -31,7 +32,7 @@ ls -la "$PWD/mnt" "$PWD/mnt/sbin" || true
 df -h "$PWD/mnt" || true
 umount "$PWD/mnt"
 
-RAWDEV="${SLICE/\/dev\/disk/\/dev\/rdisk}"
+RAWDEV="/dev/rdisk${SLICE##*disk}"
 dd if="$RAWDEV" of="$RAW" bs=1m
 hdiutil detach "$WHOLE" || true
 ls -la "$RAW"
