@@ -18,7 +18,7 @@ hdiutil create -size "${SIZEMB}m" -fs "Case-sensitive HFS+" -volname "$VOL" \
     -nospotlight "$DMG"
 
 # Newer hdiutil escapes the slashes in device paths (\/dev\/disk5s1).
-INFO=$(hdiutil attach -nomount "$DMG" | sed 's|\||g')
+INFO=$(hdiutil attach -nomount "$DMG" | tr -d '\\')
 echo "$INFO"
 WHOLE=$(echo "$INFO" | awk '/^\/dev\/disk/ {print $1}' | head -1)
 SLICE=$(echo "$INFO" | awk '/^\/dev\/disk/ && /s[0-9]+/ {print $1}' | tail -1)
