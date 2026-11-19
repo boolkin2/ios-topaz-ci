@@ -20,7 +20,10 @@ sudo chown -R 0:0 "$PWD/mnt/"
 sync
 ls -la "$PWD/mnt" "$PWD/mnt/sbin" || true
 hdiutil detach "$PWD/mnt"
+# hdiutil convert always appends .dmg to -o, even for UDRW (which is a raw,
+# uncompressed volume). Use whichever file appeared.
 hdiutil convert "$DMG" -format UDRW -o "$RAW"
+[ -f "$RAW" ] || RAW="$RAW.dmg"
 ls -la "$RAW"
 test -s "$RAW"
 gzip -9 -c "$RAW" > out/root-hfs.img.gz
