@@ -27,6 +27,18 @@ SLICE=$(echo "$INFO" | awk '/^\/dev\/disk/ && /s[0-9]+/ {print $1}' | tail -1)
 mount -t hfs "$SLICE" "$PWD/mnt"
 rsync -aH "$PWD/tree/" "$PWD/mnt/"
 sudo chown -R 0:0 "$PWD/mnt/"
+# exec bits: everything in this bring-up tree must be runnable (EACCES on
+# /sbin/launchd killed the first HFS-root boot).
+sudo chmod -R 755 "$PWD/mnt/"
+# skeleton dirs (git cannot carry empty directories; devfs needs /dev).
+for d in dev tmp private private/etc private/var private/var/tmp \
+         private/var/log private/var/root private/var/mobile \
+         usr usr/lib usr/bin usr/sbin usr/libexec usr/share \
+         System System/Library Library Applications; do
+    sudo mkdir -p "$PWD/mnt/$d"
+done
+sudo chown -R 0:0 "$PWD/mnt/"
+sudo chmod -R 755 "$PWD/mnt/"
 sync
 ls -la "$PWD/mnt" "$PWD/mnt/sbin" || true
 df -h "$PWD/mnt" || true
