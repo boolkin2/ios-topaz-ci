@@ -1,22 +1,24 @@
 #!/bin/bash
-# Build an HFS+ image (case-sensitive) containing the tree in rootfs/tree.
-# Runs on the macOS CI runner: hdiutil/newfs_hfs are native there.
-# Output: out/root-hfs.img.gz
+# Build a raw HFS+ image (case-sensitive, journaled) with the tree in rootfs/tree.
+# Runs on the macOS CI runner (newfs_hfs / hdiutil are native there).
+# Usage: build-image.sh [SIZEMB] [VOLNAME]
+# Output: rootfs/out/root-hfs.img.gz
 set -euo pipefail
 cd "$(dirname "$0")"
-SIZE="${1:-64m}"
+SIZEMB="${1:-24}"
 VOL="${2:-iOSRoot}"
-rm -rf out build; mkdir -p out build
+
+rm -rf out build; mkdir -p out build mnt
 IMG="$PWD/build/root-hfs.img"
-hdiutil create -size "$SIZE" -fs 'Case-sensitive HFS+' -volname "$VOL" -o "$PWD/build/root" "$IMG" >/dev/null
-MNT="$PWD/build/mnt"
-mkdir -p "$MNT"
-hdiutil attach "$IMG" -mountpoint "$MNT" -nobrowse >/dev/null
-# copy preserving modes, ownership and symlinks as root
-sudo rsync -aH --numeric-ids "$PWD/tree/" "$MNT/"
+
+dd if=/dev/zero of="$IMG" bs=1m count="$SIZEMB"
+newfs_hfs -s -J -v "$VOL" "$IMG"
+hdiutil attach -imagekey diskimage-class=CRawDiskImage "$IMG" -mountpoint "$PWD/mnt" -nobrowse
+rsync -aH "$PWD/tree/" "$PWD/mnt/"
+sudo chown -R 0:0 "$PWD/mnt/"
 sync
-sudo chown -R 0:0 "$MNT/" 2>/dev/null || true
-hdiutil detach "$MNT" >/dev/null
+ls -la "$PWD/mnt" "$PWD/mnt/sbin" || true
+hdiutil detach "$PWD/mnt"
 ls -la "$IMG"
 gzip -9 -c "$IMG" > out/root-hfs.img.gz
 ls -la out/

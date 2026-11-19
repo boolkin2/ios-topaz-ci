@@ -3,9 +3,9 @@ name: rootfs
 on:
   workflow_dispatch:
     inputs:
-      size:
-        description: volume size (hdiutil syntax, e.g. 64m / 4g)
-        default: "64m"
+      sizemb:
+        description: volume size in MiB
+        default: "24"
   push:
     branches: [mt6983]
     paths:
@@ -20,8 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build HFS+ image
         run: |
-          brew install rsync 2>/dev/null || true
-          bash rootfs/build-image.sh "${{ inputs.size || '64m' }}"
+          bash rootfs/build-image.sh "${{ inputs.sizemb || '24' }}"
       - uses: actions/upload-artifact@v4
         with:
           name: root-hfs
