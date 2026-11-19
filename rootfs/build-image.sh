@@ -14,11 +14,20 @@ DMG="$PWD/build/root-hfs.dmg"
 RAW="$PWD/build/root-hfs.img"
 
 rm -rf out build mnt; mkdir -p out build mnt
+
+# Optional userland overlay: real iOS binaries (launchd, dyld, dylibs).
+# The tarball is built out-of-tree (see build_userland.py) and committed here
+# because git cannot carry HFS metadata and the CI runner has no APFS tooling.
+OVERLAY="$PWD/userland.tar.gz"
+if [ -f "$OVERLAY" ]; then
+    echo "[*] overlay: $OVERLAY"
+    tar xzf "$OVERLAY" -C "$PWD/tree"
+fi
+
 hdiutil create -size "${SIZEMB}m" -fs "Case-sensitive HFS+" -volname "$VOL" \
     -nospotlight "$DMG"
 
-# Newer hdiutil escapes the slashes in device paths (\/dev\/disk5s1).
-INFO=$(hdiutil attach -nomount "$DMG" | tr -d '\\')
+INFO=$(hdiutil attach -nomount "$DMG" | tr -d '\')
 echo "$INFO"
 WHOLE=$(echo "$INFO" | awk '/^\/dev\/disk/ {print $1}' | head -1)
 SLICE=$(echo "$INFO" | awk '/^\/dev\/disk/ && /s[0-9]+/ {print $1}' | tail -1)
@@ -26,21 +35,25 @@ SLICE=$(echo "$INFO" | awk '/^\/dev\/disk/ && /s[0-9]+/ {print $1}' | tail -1)
 
 mount -t hfs "$SLICE" "$PWD/mnt"
 rsync -aH "$PWD/tree/" "$PWD/mnt/"
-sudo chown -R 0:0 "$PWD/mnt/"
 # exec bits: everything in this bring-up tree must be runnable (EACCES on
 # /sbin/launchd killed the first HFS-root boot).
+sudo chown -R 0:0 "$PWD/mnt/"
 sudo chmod -R 755 "$PWD/mnt/"
 # skeleton dirs (git cannot carry empty directories; devfs needs /dev).
 for d in dev tmp private private/etc private/var private/var/tmp \
-         private/var/log private/var/root private/var/mobile \
-         usr usr/lib usr/bin usr/sbin usr/libexec usr/share \
-         System System/Library Library Applications; do
+         private/var/log private/var/root private/var/run private/var/db \
+         private/var/mobile private/var/preferences \
+         usr usr/lib usr/bin usr/sbin usr/libexec usr/share usr/standalone \
+         System System/Library System/Library/LaunchDaemons \
+         System/Library/PrivateFrameworks System/Library/Frameworks \
+         System/Library/CoreServices System/Library/Extensions \
+         Library Library/LaunchDaemons Applications cores; do
     sudo mkdir -p "$PWD/mnt/$d"
 done
 sudo chown -R 0:0 "$PWD/mnt/"
 sudo chmod -R 755 "$PWD/mnt/"
 sync
-ls -la "$PWD/mnt" "$PWD/mnt/sbin" || true
+ls -la "$PWD/mnt" "$PWD/mnt/sbin" "$PWD/mnt/usr/lib" || true
 df -h "$PWD/mnt" || true
 umount "$PWD/mnt"
 
