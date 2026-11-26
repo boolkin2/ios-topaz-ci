@@ -35,7 +35,7 @@ diff --git a/osfmk/kern/sweet_usb_log.c b/osfmk/kern/sweet_usb_log.c
 new file mode 100644
 --- /dev/null
 +++ b/osfmk/kern/sweet_usb_log.c
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,276 @@
 +#include <arm/machine_routines.h>
 +#include <arm/pmap.h>
 +#include <kern/clock.h>
@@ -43,6 +43,8 @@ new file mode 100644
 +#include <mach/clock_types.h>
 +
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++void sweet_usb_log_start(void);
 +
 +#define SWEET_USB_MAC_PA       0x11201000UL
 +#define SWEET_USB_MAC_SIZE     0x1000UL
@@ -270,7 +272,7 @@ new file mode 100644
 +sweet_usb_log_thread(__unused void *arg, __unused wait_result_t wr)
 +{
 +	volatile uint32_t *pmsg = (volatile uint32_t *)SWEET_PMSG_KVA;
-+	sweet_usb_mac = ml_io_map(SWEET_USB_MAC_PA, SWEET_USB_MAC_SIZE);
++	sweet_usb_mac = (volatile uint32_t *)ml_io_map(SWEET_USB_MAC_PA, SWEET_USB_MAC_SIZE);
 +	if (sweet_usb_mac == NULL || pmsg[0] != 0x43474244u) {
 +		return;
 +	}
