@@ -1,0 +1,156 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@
+ #define REG_MTK_HW_VER      0x2240
+ #define REG_MTK_DEBUG_SEL   0x22c0
+ #define REG_MTK_PROBE       0x22c8
++#define MTK_VS_LINK_UP      2u
+ #define REG_MTK_DEBUG_B0    0x22d0
+ 
+ #define HCS_DP              (1u << 0)
+@@ -491,6 +492,26 @@
+ 	return error ? error : (result ? EIO : 0);
+ }
+ 
++/* Both the list installation and each doorbell must prove the host is ours. */
++static int
++sweet_ufs_check_utrl(uint64_t list)
++{
++	uint32_t hcs = sweet_ufs_rd(REG_HCS);
++	if (!(sweet_ufs_rd(REG_HCE) & 1u) ||
++	    (hcs & (HCS_DP | HCS_UTRLRDY)) != (HCS_DP | HCS_UTRLRDY)) {
++		return ENXIO;
++	}
++	if (sweet_ufs_rd(REG_UTRLDBR) != 0u) {
++		return EBUSY;
++	}
++	if (sweet_ufs_rd(REG_UTRLBA) != (uint32_t)list ||
++	    sweet_ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
++	    !(sweet_ufs_rd(REG_UTRLRSR) & 1u)) {
++		return EIO;
++	}
++	return 0;
++}
++
+ static int
+ sweet_ufs_scsi(const uint8_t *cdb, unsigned int cdb_len, uint32_t len, bool write)
+ {
+@@ -499,7 +520,16 @@
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
+ 	uint64_t bounce_pa = su.dma_pa + DMA_BOUNCE;
+ 	uint32_t is = 0;
+-
++	int list_error;
++
++	if (write) {
++		return EROFS;
++	}
++	list_error = sweet_ufs_check_utrl(su.dma_pa + DMA_UTRL);
++	if (list_error) {
++		UFS_MARK('U', '0', '5', '4', list_error);
++		return list_error;
++	}
+ 	if (cdb_len > 16 || len > BOUNCE_SIZE) {
+ 		return EINVAL;
+ 	}
+@@ -536,6 +566,11 @@
+ 	if (len) {
+ 		sweet_ufs_dma_sync(DMA_BOUNCE, len);
+ 	}
++	list_error = sweet_ufs_check_utrl(su.dma_pa + DMA_UTRL);
++	if (list_error) {
++		UFS_MARK('U', '0', '5', '4', list_error);
++		return list_error;
++	}
+ 	sweet_ufs_wr(REG_UTRLDBR, 1u);
+ 
+ 	uint64_t deadline;
+@@ -714,13 +749,12 @@
+ {
+ 	uint32_t result = 0xff, value = 0;
+ 	int error;
+-	int refclk = 1, recovery = 1, cold = 0, mphy_vendor = 0, writable = 0;
++	int refclk = 1, recovery = 0, cold = 0, mphy_vendor = 0;
+ 	PE_parse_boot_argn("ufs_refclk", &refclk, sizeof(refclk));
+ 	PE_parse_boot_argn("ufs_recovery", &recovery, sizeof(recovery));
+ 	PE_parse_boot_argn("ufs_cold", &cold, sizeof(cold));
+ 	PE_parse_boot_argn("ufs_mphy_vendor", &mphy_vendor, sizeof(mphy_vendor));
+-	PE_parse_boot_argn("ufswrite", &writable, sizeof(writable));
+-	su.writable = writable != 0;
++	su.writable = false;
+ 
+ 	sweet_ufs_ungate_clocks();
+ 	if (mphy_vendor) {
+@@ -756,7 +790,8 @@
+ 	error = sweet_ufs_uic(UIC_DME_PEER_GET, PA_PWRMODE << 16, &result, &value);
+ 	printf("SWEET UFS: peer PWRMODE result %02x value %08x\n", result, value);
+ 	UFS_MARK('U', '0', '4', '0', result);
+-	if ((error || result != 0) && recovery) {
++	if ((error || result != 0) && recovery &&
++	    (sweet_ufs_read_link_probe() >> 28) != MTK_VS_LINK_UP) {
+ 		uint32_t recovery_result, recovery_value;
+ 		int recovery_error = sweet_ufs_uic(UIC_DME_RESET, 0,
+ 		    &recovery_result, &recovery_value);
+@@ -784,13 +819,32 @@
+ 		    result, value, sweet_ufs_rd(REG_HCS));
+ 		UFS_MARK('U', '0', '4', '1', result);
+ 	}
+-	if (error || result != 0 || !(sweet_ufs_rd(REG_HCS) & HCS_DP)) {
+-		return ENXIO;
++	/* A failed PEER_GET is not a reason to reset an apparently live link. */
++	uint32_t probe = sweet_ufs_read_link_probe();
++	hcs = sweet_ufs_rd(REG_HCS);
++	UFS_MARK('U', '0', '5', '6', probe);
++	UFS_MARK('U', '0', '5', '7', hcs);
++	if ((probe >> 28) != MTK_VS_LINK_UP || !(sweet_ufs_rd(REG_HCE) & 1u) ||
++	    (hcs & (HCS_DP | HCS_UTRLRDY)) != (HCS_DP | HCS_UTRLRDY)) {
++		return ENXIO;
++	}
++	uint32_t dbr = sweet_ufs_rd(REG_UTRLDBR);
++	UFS_MARK('U', '0', '5', '8', dbr);
++	if (dbr != 0u) {
++		return EBUSY;
+ 	}
+ 
+ 	sweet_ufs_wr(REG_IE, 0u);
+ 	sweet_ufs_wr(REG_IS, sweet_ufs_rd(REG_IS));
+ 	sweet_ufs_wr(REG_UTRLRSR, 0u);
++	if (sweet_ufs_rd(REG_UTRLRSR) & 1u) {
++		UFS_MARK('U', '0', '5', '3', EIO);
++		return EIO;
++	}
++	if (sweet_ufs_rd(REG_UTRLDBR) != 0u) {
++		UFS_MARK('U', '0', '5', '3', EBUSY);
++		return EBUSY;
++	}
+ 	uint64_t list = su.dma_pa + DMA_UTRL;
+ 	sweet_ufs_wr(REG_UTRLBA, (uint32_t)list);
+ 	sweet_ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+@@ -798,11 +852,10 @@
+ 	for (unsigned int i = 0; i < 1000u && !(sweet_ufs_rd(REG_HCS) & HCS_UTRLRDY); i++) {
+ 		sweet_ufs_delay_us(100);
+ 	}
+-	if (sweet_ufs_rd(REG_UTRLBA) != (uint32_t)list ||
+-	    sweet_ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+-	    !(sweet_ufs_rd(REG_HCS) & HCS_UTRLRDY)) {
+-		UFS_MARK('U', '0', '5', '0', sweet_ufs_rd(REG_HCS));
+-		return EIO;
++	error = sweet_ufs_check_utrl(list);
++	if (error) {
++		UFS_MARK('U', '0', '5', '0', error);
++		return error;
+ 	}
+ 	UFS_MARK('U', '0', '5', '1', list);
+ 	return 0;
+@@ -1045,9 +1098,11 @@
+ 		for (int i = 0; i < 8 && (error = sweet_ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 			sweet_ufs_delay_us(2000);
+ 		}
++		UFS_MARK('U', '0', '5', '2', error);
+ 	}
+ 	if (!error) {
+ 		error = sweet_ufs_read_capacity();
++		UFS_MARK('U', '0', '6', '1', error);
+ 		UFS_MARK('U', '0', '6', '0', su.block_size);
+ 	}
+ 	if (!error) {
