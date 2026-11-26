@@ -1,0 +1,24 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -664,10 +664,18 @@
+ 	printf("SWEET UFS: peer PWRMODE result %02x value %08x\n", result, value);
+ 	UFS_MARK('U', '0', '4', '0', result);
+ 	if ((error || result != 0) && recovery) {
+-		uint32_t ignored;
+-		(void)sweet_ufs_uic(UIC_DME_RESET, 0, &ignored, &ignored);
++		uint32_t recovery_result, recovery_value;
++		int recovery_error = sweet_ufs_uic(UIC_DME_RESET, 0,
++		    &recovery_result, &recovery_value);
++		UFS_MARK('U', '0', '4', '2',
++		    ((uint32_t)recovery_error << 8) | recovery_result);
++		UFS_MARK('U', '0', '4', '3', sweet_ufs_rd(REG_HCS));
+ 		sweet_ufs_delay_us(5000);
+-		(void)sweet_ufs_uic(UIC_DME_LINK_STARTUP, 0, &ignored, &ignored);
++		recovery_error = sweet_ufs_uic(UIC_DME_LINK_STARTUP, 0,
++		    &recovery_result, &recovery_value);
++		UFS_MARK('U', '0', '4', '4',
++		    ((uint32_t)recovery_error << 8) | recovery_result);
++		UFS_MARK('U', '0', '4', '5', sweet_ufs_rd(REG_HCS));
+ 		sweet_ufs_delay_us(20000);
+ 		error = sweet_ufs_uic(UIC_DME_PEER_GET, PA_PWRMODE << 16, &result, &value);
+ 		printf("SWEET UFS: recovered peer PWRMODE result %02x value %08x HCS %08x\n",
