@@ -1,0 +1,15 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -238,6 +238,12 @@
+ 	sweet_ufs_wr32(su.pmif, PMIF_SWINF2_ACC,
+ 	    SPMI_EXT_REG_LONG | (slave << 24) | (write ? SPMI_WRITE : 0u) | (addr & 0xffffu));
+ 
++	/* PMIF writes are posted; only reads return WFVLDCLR.  The next
++	 * transaction waits for IDLE, and RMW verifies via a readback. */
++	if (write) {
++		return 0;
++	}
++
+ 	nanoseconds_to_absolutetime(SPMI_TIMEOUT_NS, &deadline);
+ 	deadline += mach_absolute_time();
+ 	for (;;) {
