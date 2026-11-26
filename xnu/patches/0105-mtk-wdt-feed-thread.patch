@@ -21,7 +21,7 @@ index 33d73df..6093be0 100644
 +	if (wdt == 0) {
 +		return;
 +	}
-+	for (int i = 0; i < 45; i++) {
++	for (int i = 0; i < 90; i++) {
 +		*(volatile unsigned int *)(wdt + 0x08) = 0x1971u;
 +		clock_interval_to_deadline(2, NSEC_PER_SEC, &deadline);
 +		clock_delay_until(deadline);

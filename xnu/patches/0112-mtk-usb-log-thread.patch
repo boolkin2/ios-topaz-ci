@@ -9,28 +9,6 @@ diff --git a/osfmk/conf/files b/osfmk/conf/files
  osfmk/kern/sync_sema.c		standard
  osfmk/kern/syscall_subr.c		standard
  osfmk/kern/syscall_sw.c		standard
-diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
---- a/osfmk/kern/startup.c
-+++ b/osfmk/kern/startup.c
-@@ -176,6 +176,10 @@
- #include <i386/pmCPU.h>
- static void             kernel_bootstrap_thread(void);
- 
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
-+extern void sweet_usb_log_start(void);
-+#endif
-+
- static void             load_context(
- 	thread_t        thread);
- 
-@@ -730,6 +734,7 @@
- 
- #if defined(ARM64_BOARD_CONFIG_SWEET)
- 	sweet_wdt_start();
-+	sweet_usb_log_start();
- 	sweet_fb_refresh_start();
- #endif
- 
 diff --git a/osfmk/kern/sweet_usb_log.c b/osfmk/kern/sweet_usb_log.c
 new file mode 100644
 --- /dev/null

@@ -1,0 +1,1027 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -104,6 +104,7 @@
+ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
++bsd/dev/sweet_ufs.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -62,6 +62,7 @@
+ 
+ extern dev_t mdevadd(int devid, uint64_t base, unsigned int size, int phys);
+ extern dev_t mdevlookup(int devid);
++extern "C" int sweet_ufs_rootdev(dev_t *dev);
+ extern void mdevremoveall(void);
+ extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
+ extern void di_root_ramfile(IORegistryEntry * entry);
+@@ -767,6 +768,20 @@
+ 	}
+ 
+ //
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (strcmp(rdBootVar, "ufsroot0") == 0) {
++		OSSafeReleaseNULL(matching);
++		int ufs_error = sweet_ufs_rootdev(root);
++		if (ufs_error) {
++			panic("IOFindBSDRoot: MTK UFS root %s unavailable: %d", rdBootVar, ufs_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ //	Now check if we are trying to root on a memory device
+ //
+ 
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_ufs.c
+@@ -0,0 +1,979 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <mach/clock_types.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void sweet_late_mark(unsigned int tag, unsigned int val);
++
++#define UFS_TAG(a, b, c, d) \
++	((unsigned int)(a) | ((unsigned int)(b) << 8) | \
++	 ((unsigned int)(c) << 16) | ((unsigned int)(d) << 24))
++#define UFS_MARK(a, b, c, d, value) sweet_late_mark(UFS_TAG(a, b, c, d), (unsigned int)(value))
++
++#define REG_IS              0x20
++#define REG_IE              0x24
++#define REG_HCS             0x30
++#define REG_HCE             0x34
++#define REG_UECPA           0x38
++#define REG_UECDL           0x3c
++#define REG_UTRLBA          0x50
++#define REG_UTRLBAU         0x54
++#define REG_UTRLDBR         0x58
++#define REG_UTRLCLR         0x5c
++#define REG_UTRLRSR         0x60
++#define REG_UTMRLBA         0x70
++#define REG_UTMRLBAU        0x74
++#define REG_UTMRLRSR        0x80
++#define REG_UICCMD          0x90
++#define REG_UICARG1         0x94
++#define REG_UICARG2         0x98
++#define REG_UICARG3         0x9c
++#define REG_XOUFS           0x140
++#define REG_REFCLK          0x144
++#define REG_MTK_HW_VER      0x2240
++
++#define HCS_DP              (1u << 0)
++#define HCS_UTRLRDY         (1u << 1)
++#define HCS_UICRDY          (1u << 3)
++#define IS_UTP_COMPLETE     (1u << 0)
++#define IS_UIC_COMPLETE     (1u << 10)
++#define IS_UIC_ERROR        (1u << 2)
++#define IS_FATAL_MASK       (1u << 11) | (1u << 16) | (1u << 17) | (1u << 18)
++
++#define UIC_DME_GET         0x01
++#define UIC_DME_PEER_GET    0x03
++#define UIC_DME_ENABLE      0x12
++#define UIC_DME_RESET       0x14
++#define UIC_DME_LINK_STARTUP 0x16
++#define UIC_DME_HIBER_EXIT  0x18
++#define UIC_RESULT_MASK     0xffu
++#define PA_PWRMODE          0x1571u
++
++#define PMIF_SWINF2_STA     0x8a8
++#define PMIF_SWINF2_WDATA   0x884
++#define PMIF_SWINF2_RDATA   0x894
++#define PMIF_SWINF2_ACC     0x880
++#define PMIF_SWINF2_VLD_CLR 0x8a4
++#define PMIF_STA_IDLE       0u
++#define PMIF_STA_WFVLDCLR   6u
++#define PMIF_STA_ERROR      (1u << 18)
++#define SPMI_EXT_REG_LONG   (3u << 30)
++#define SPMI_WRITE          (1u << 29)
++
++#define MT6685_XO_BBCK3_VOTE_L 0x550
++#define MT6685_XO_BBCK3_VOTE_H 0x551
++#define MT6685_XO_BBCK3_REG    0x79c
++#define MT6685_XO_BBCK3_EN_M   (1u << 2)
++#define MT6685_XO_BBCK3_MODE   0x3u
++#define SRCLKEN_M00_CFG       0x20
++#define SRCLKEN_SW_RC_EN       (1u << 3)
++#define SRCLKEN_SW_RC_REQ_MASK 0x3u
++#define SRCLKEN_SW_RC_REQ_SHIFT 4u
++
++#define MP_GLB_DIG_8C        0x008c
++#define MP_LN_DIG_RX_9C      0xa09c
++#define MP_LN_DIG_RX_AC      0xa0ac
++#define MP_LN_RX_44          0xb044
++#define MP_FRC_PLL_ISO_EN    (1u << 8)
++#define MP_PLL_ISO_EN        (1u << 9)
++#define MP_FRC_FRC_PWR_ON    (1u << 10)
++#define MP_PLL_PWR_ON        (1u << 11)
++#define MP_FSM_DIFZ_FRC      (1u << 18)
++#define MP_FRC_RX_SQ_EN      (1u << 0)
++#define MP_RX_SQ_EN          (1u << 1)
++#define MP_FRC_CDR_PWR_ON    (1u << 17)
++#define MP_CDR_PWR_ON        (1u << 18)
++#define MP_FRC_CDR_ISO_EN    (1u << 19)
++#define MP_CDR_ISO_EN        (1u << 20)
++
++#define BOUNCE_SIZE          (1u << 20)
++#define PRDT_CHUNK           (256u << 10)
++#define PRDT_MAX             (BOUNCE_SIZE / PRDT_CHUNK)
++#define CMD_TIMEOUT_NS       (5ull * NSEC_PER_SEC)
++#define UIC_TIMEOUT_NS       (1ull * NSEC_PER_SEC)
++#define SPMI_TIMEOUT_NS      (100ull * NSEC_PER_MSEC)
++
++#define DMA_UTRL             0x0000
++#define DMA_UCD              0x1000
++#define DMA_BOUNCE           0x4000
++#define DMA_SIZE             (DMA_BOUNCE + BOUNCE_SIZE)
++
++struct sweet_ufs_utrd {
++	uint32_t dw0, dw1, dw2, dw3;
++	uint32_t ucdba, ucdbau;
++	uint32_t resp;
++	uint32_t prdt;
++};
++
++struct sweet_ufs_ucd {
++	uint8_t cmd[512];
++	uint8_t resp[512];
++	struct {
++		uint32_t addr_lo, addr_hi, rsvd, dbc;
++	} prdt[PRDT_MAX];
++};
++
++static struct {
++	vm_offset_t regs, mphy, lk_phy, ao_cfg, pdn_cfg, topckgen;
++	vm_offset_t pmif, spmimst, srclken;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	uint8_t lun, tag;
++	uint32_t block_size;
++	uint64_t device_blocks;
++	uint32_t refclk_slave, refclk_reg, refclk_en_bit, srclken_index;
++	uint64_t first_block, nblocks;
++	uint32_t secsize;
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready, writable;
++} su;
++
++static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
++static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
++
++static inline uint32_t
++sweet_ufs_rd32(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++sweet_ufs_wr32(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__builtin_arm_dsb(0xf);
++}
++
++static inline uint32_t
++sweet_ufs_rd(uint32_t off)
++{
++	return sweet_ufs_rd32(su.regs, off);
++}
++
++static inline void
++sweet_ufs_wr(uint32_t off, uint32_t value)
++{
++	sweet_ufs_wr32(su.regs, off, value);
++}
++
++static void
++sweet_ufs_delay_us(uint32_t usec)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(usec, NSEC_PER_USEC, &deadline);
++	clock_delay_until(deadline);
++}
++
++static int
++sweet_ufs_map_reg(DTEntry node, const char *name, vm_offset_t *mapped, uint64_t *phys)
++{
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	if (SecureDTGetProperty(node, name, (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t) || reg[1] == 0) {
++		return ENXIO;
++	}
++	*phys = reg[0];
++	*mapped = ml_io_map(reg[0], reg[1]);
++	return *mapped == 0 ? ENOMEM : 0;
++}
++
++static int
++sweet_ufs_map_u32(DTEntry node, const char *name, uint32_t *value)
++{
++	uint32_t const *property = NULL;
++	unsigned int size = 0;
++	if (SecureDTGetProperty(node, name, (void const **)&property, &size) != kSuccess ||
++	    size < sizeof(uint32_t)) {
++		return ENXIO;
++	}
++	*value = *property;
++	return 0;
++}
++
++static void
++sweet_ufs_dma_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
++	__builtin_arm_dsb(0xf);
++}
++
++static int
++sweet_ufs_spmi(uint32_t slave, uint32_t addr, uint32_t *value, bool write)
++{
++	uint64_t deadline;
++	uint32_t status = 0;
++
++	nanoseconds_to_absolutetime(SPMI_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (((sweet_ufs_rd32(su.pmif, PMIF_SWINF2_STA) >> 1) & 7u) != PMIF_STA_IDLE) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		sweet_ufs_delay_us(2);
++	}
++
++	if (write) {
++		sweet_ufs_wr32(su.pmif, PMIF_SWINF2_WDATA, *value);
++	}
++	sweet_ufs_wr32(su.pmif, PMIF_SWINF2_ACC,
++	    SPMI_EXT_REG_LONG | (slave << 24) | (write ? SPMI_WRITE : 0u) | (addr & 0xffffu));
++
++	nanoseconds_to_absolutetime(SPMI_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		status = sweet_ufs_rd32(su.pmif, PMIF_SWINF2_STA);
++		uint32_t fsm = (status >> 1) & 7u;
++		if (fsm == PMIF_STA_WFVLDCLR || (status & PMIF_STA_ERROR)) {
++			if (!write) {
++				*value = sweet_ufs_rd32(su.pmif, PMIF_SWINF2_RDATA);
++			}
++			sweet_ufs_wr32(su.pmif, PMIF_SWINF2_VLD_CLR, 1u);
++			return fsm == PMIF_STA_WFVLDCLR && !(status & PMIF_STA_ERROR) ? 0 : EIO;
++		}
++		if (mach_absolute_time() > deadline) {
++			sweet_ufs_wr32(su.pmif, PMIF_SWINF2_VLD_CLR, 1u);
++			return ETIMEDOUT;
++		}
++		sweet_ufs_delay_us(2);
++	}
++}
++
++static int
++sweet_ufs_spmi_rmw(uint32_t slave, uint32_t addr, uint32_t mask, uint32_t shift, uint32_t value)
++{
++	uint32_t old;
++	int error = sweet_ufs_spmi(slave, addr, &old, false);
++	if (error) {
++		return error;
++	}
++	uint32_t updated = (old & ~mask) | ((value << shift) & mask);
++	if (updated == old) {
++		return 0;
++	}
++	error = sweet_ufs_spmi(slave, addr, &updated, true);
++	if (error) {
++		return error;
++	}
++	uint32_t readback = 0;
++	error = sweet_ufs_spmi(slave, addr, &readback, false);
++	if (!error && readback != updated) {
++		error = EIO;
++	}
++	printf("SWEET UFS: SPMI %u:%04x %08x -> %08x\n", slave, addr, old, readback);
++	return error;
++}
++
++static void
++sweet_ufs_ungate_clocks(void)
++{
++	sweet_ufs_wr32(su.topckgen, 0x18, 1u << 23);
++	sweet_ufs_wr32(su.topckgen, 0x04, 1u << 2);
++	sweet_ufs_wr32(su.topckgen, 0xe8, 1u << 31);
++	sweet_ufs_wr32(su.topckgen, 0x08, 1u << 24);
++	sweet_ufs_wr32(su.topckgen, 0xf8, (1u << 7) | (1u << 15));
++	sweet_ufs_wr32(su.topckgen, 0x08, (1u << 25) | (1u << 26));
++	sweet_ufs_wr32(su.topckgen, 0x138, 1u << 15);
++	sweet_ufs_wr32(su.topckgen, 0x0c, 1u << 11);
++}
++
++static void
++sweet_ufs_mphy_active(void)
++{
++	sweet_ufs_wr32(su.mphy, MP_GLB_DIG_8C,
++	    sweet_ufs_rd32(su.mphy, MP_GLB_DIG_8C) | MP_PLL_PWR_ON);
++	sweet_ufs_wr32(su.mphy, MP_GLB_DIG_8C,
++	    sweet_ufs_rd32(su.mphy, MP_GLB_DIG_8C) & ~MP_FRC_FRC_PWR_ON);
++	sweet_ufs_wr32(su.mphy, MP_GLB_DIG_8C,
++	    sweet_ufs_rd32(su.mphy, MP_GLB_DIG_8C) & ~(MP_PLL_ISO_EN | MP_FRC_PLL_ISO_EN));
++	sweet_ufs_wr32(su.mphy, MP_LN_RX_44,
++	    sweet_ufs_rd32(su.mphy, MP_LN_RX_44) | MP_CDR_PWR_ON);
++	sweet_ufs_wr32(su.mphy, MP_LN_RX_44,
++	    sweet_ufs_rd32(su.mphy, MP_LN_RX_44) & ~MP_FRC_CDR_PWR_ON);
++	sweet_ufs_wr32(su.mphy, MP_LN_RX_44,
++	    sweet_ufs_rd32(su.mphy, MP_LN_RX_44) & ~(MP_CDR_ISO_EN | MP_FRC_CDR_ISO_EN));
++	sweet_ufs_wr32(su.mphy, MP_LN_DIG_RX_AC,
++	    sweet_ufs_rd32(su.mphy, MP_LN_DIG_RX_AC) | MP_RX_SQ_EN);
++	sweet_ufs_wr32(su.mphy, MP_LN_DIG_RX_AC,
++	    sweet_ufs_rd32(su.mphy, MP_LN_DIG_RX_AC) & ~MP_FRC_RX_SQ_EN);
++	sweet_ufs_delay_us(10);
++	sweet_ufs_wr32(su.mphy, MP_LN_DIG_RX_9C,
++	    sweet_ufs_rd32(su.mphy, MP_LN_DIG_RX_9C) & ~MP_FSM_DIFZ_FRC);
++}
++
++static int
++sweet_ufs_refclk_enable(void)
++{
++	uint32_t value = 0, status = 0;
++	int error;
++
++	UFS_MARK('U', '0', '1', '0', 1);
++	error = sweet_ufs_spmi(su.refclk_slave, su.refclk_reg, &value, false);
++	if (error) {
++		return error;
++	}
++	printf("SWEET UFS: XO_BBCK3 before %08x\n", value);
++	error = sweet_ufs_spmi_rmw(su.refclk_slave, su.refclk_reg,
++	    MT6685_XO_BBCK3_MODE, 0, 0);
++	if (!error) {
++		error = sweet_ufs_spmi_rmw(su.refclk_slave, su.refclk_reg,
++		    1u << su.refclk_en_bit, su.refclk_en_bit, 1);
++	}
++	if (error) {
++		return error;
++	}
++	sweet_ufs_delay_us(400);
++	uint32_t after = 0;
++	error = sweet_ufs_spmi(su.refclk_slave, su.refclk_reg, &after, false);
++	if (error) {
++		return error;
++	}
++
++	uint32_t vote_l = 0xff, vote_h = 0x3f;
++	error = sweet_ufs_spmi(su.refclk_slave, MT6685_XO_BBCK3_VOTE_L, &vote_l, true);
++	if (!error) {
++		error = sweet_ufs_spmi(su.refclk_slave, MT6685_XO_BBCK3_VOTE_H, &vote_h, true);
++	}
++	if (error) {
++		return error;
++	}
++
++	uint32_t cfg_off = SRCLKEN_M00_CFG + su.srclken_index * 4u;
++	uint32_t cfg = sweet_ufs_rd32(su.srclken, cfg_off);
++	uint32_t updated = (cfg & ~(SRCLKEN_SW_RC_REQ_MASK << SRCLKEN_SW_RC_REQ_SHIFT)) |
++	    SRCLKEN_SW_RC_EN;
++	sweet_ufs_wr32(su.srclken, cfg_off, updated);
++	cfg = sweet_ufs_rd32(su.srclken, cfg_off);
++	if (cfg != updated) {
++		return EIO;
++	}
++	printf("SWEET UFS: XO_BBCK3 after %08x, srclken[%u] %08x\n",
++	    after, su.srclken_index, cfg);
++
++	sweet_ufs_wr(REG_REFCLK, 1u);
++	for (unsigned int i = 0; i < 3000u; i++) {
++		status = sweet_ufs_rd(REG_REFCLK);
++		if (status & 2u) {
++			UFS_MARK('U', '0', '1', '1', status);
++			return 0;
++		}
++		sweet_ufs_delay_us(2);
++	}
++	UFS_MARK('U', '0', '1', '2', status);
++	return ETIMEDOUT;
++}
++
++static int
++sweet_ufs_cold_init(void)
++{
++	uint32_t before = sweet_ufs_rd32(su.ao_cfg, 0x44);
++	sweet_ufs_wr32(su.ao_cfg, 0x44, 1u << 1);
++	sweet_ufs_wr32(su.pdn_cfg, 0x44, (1u << 0) | (1u << 1));
++	sweet_ufs_delay_us(200);
++	sweet_ufs_wr32(su.ao_cfg, 0x48, 1u << 1);
++	sweet_ufs_delay_us(200);
++	sweet_ufs_wr32(su.pdn_cfg, 0x48, 1u << 0);
++	sweet_ufs_delay_us(50);
++	sweet_ufs_wr32(su.pdn_cfg, 0x48, 1u << 1);
++	sweet_ufs_delay_us(300);
++	if (sweet_ufs_rd32(su.ao_cfg, 0x44) == 0 ||
++	    sweet_ufs_rd32(su.pdn_cfg, 0x44) == 0) {
++		printf("SWEET UFS: reset syscons unavailable (before %08x)\n", before);
++		return ENXIO;
++	}
++	sweet_ufs_mphy_active();
++	sweet_ufs_wr(REG_XOUFS, sweet_ufs_rd(REG_XOUFS) | 0x80u);
++	sweet_ufs_wr(REG_HCE, 1u);
++	sweet_ufs_delay_us(1000);
++	return 0;
++}
++
++static int
++sweet_ufs_uic(uint32_t opcode, uint32_t arg1, uint32_t *result, uint32_t *value)
++{
++	uint64_t deadline;
++	uint32_t status = 0;
++
++	sweet_ufs_wr(REG_UICARG1, arg1);
++	sweet_ufs_wr(REG_UICARG2, 0u);
++	sweet_ufs_wr(REG_UICARG3, 0u);
++	sweet_ufs_wr(REG_UICCMD, opcode & 0xffu);
++	nanoseconds_to_absolutetime(UIC_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	for (;;) {
++		status = sweet_ufs_rd(REG_IS);
++		if (status & (IS_UIC_COMPLETE | IS_UIC_ERROR | IS_FATAL_MASK)) {
++			sweet_ufs_wr(REG_IS, status);
++			*result = sweet_ufs_rd(REG_UICARG2) & UIC_RESULT_MASK;
++			*value = sweet_ufs_rd(REG_UICARG3);
++			return status & IS_UIC_COMPLETE ? 0 : EIO;
++		}
++		if (mach_absolute_time() > deadline) {
++			*result = 0xffu;
++			*value = 0;
++			return ETIMEDOUT;
++		}
++		sweet_ufs_delay_us(10);
++	}
++}
++
++static int
++sweet_ufs_scsi(const uint8_t *cdb, unsigned int cdb_len, uint32_t len, bool write)
++{
++	struct sweet_ufs_utrd *utrd = (struct sweet_ufs_utrd *)(su.dma + DMA_UTRL);
++	struct sweet_ufs_ucd *ucd = (struct sweet_ufs_ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++	uint64_t bounce_pa = su.dma_pa + DMA_BOUNCE;
++	uint32_t is = 0;
++
++	if (cdb_len > 16 || len > BOUNCE_SIZE) {
++		return EINVAL;
++	}
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++	ucd->cmd[0] = 0x01;
++	ucd->cmd[1] = len ? (write ? 0x20u : 0x40u) : 0u;
++	ucd->cmd[2] = su.lun;
++	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[12] = (uint8_t)(len >> 24);
++	ucd->cmd[13] = (uint8_t)(len >> 16);
++	ucd->cmd[14] = (uint8_t)(len >> 8);
++	ucd->cmd[15] = (uint8_t)len;
++	memcpy(&ucd->cmd[16], cdb, cdb_len);
++
++	utrd->dw0 = (1u << 24) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 28);
++	utrd->dw2 = 0x0f;
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4u) << 16 | (512u / 4u);
++	if (len) {
++		uint32_t entries = 0;
++		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, entries++) {
++			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
++			ucd->prdt[entries].addr_lo = (uint32_t)(bounce_pa + done);
++			ucd->prdt[entries].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++			ucd->prdt[entries].dbc = chunk - 1u;
++		}
++		utrd->prdt = (1024u / 4u) << 16 | entries;
++	}
++
++	sweet_ufs_dma_sync(DMA_UTRL, sizeof(*utrd));
++	sweet_ufs_dma_sync(DMA_UCD, sizeof(*ucd));
++	if (len) {
++		sweet_ufs_dma_sync(DMA_BOUNCE, len);
++	}
++	sweet_ufs_wr(REG_UTRLDBR, 1u);
++
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (!(is & (IS_UTP_COMPLETE | IS_UIC_ERROR | IS_FATAL_MASK))) {
++		is = sweet_ufs_rd(REG_IS);
++		if (is & (IS_UTP_COMPLETE | IS_UIC_ERROR | IS_FATAL_MASK)) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			sweet_ufs_wr(REG_UTRLCLR, ~1u);
++			sweet_ufs_wr(REG_IS, sweet_ufs_rd(REG_IS));
++			printf("SWEET UFS: command %02x timeout, HCS %08x IS %08x\n",
++			    cdb[0], sweet_ufs_rd(REG_HCS), is);
++			return ETIMEDOUT;
++		}
++		sweet_ufs_delay_us(10);
++	}
++	sweet_ufs_wr(REG_IS, is);
++	sweet_ufs_dma_sync(DMA_UTRL, sizeof(*utrd));
++	sweet_ufs_dma_sync(DMA_UCD, sizeof(*ucd));
++	if (len) {
++		sweet_ufs_dma_sync(DMA_BOUNCE, len);
++	}
++
++	uint32_t ocs = utrd->dw2 & 0x0f;
++	if (!(is & IS_UTP_COMPLETE) || ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
++		printf("SWEET UFS: command %02x failed: IS %08x OCS %x RSP %02x status %02x/%02x HCS %08x\n",
++		    cdb[0], is, ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7], sweet_ufs_rd(REG_HCS));
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++sweet_ufs_transfer_blocks(uint64_t lba, uint32_t count, bool write)
++{
++	if (lba > UINT32_MAX || count == 0 || count > BOUNCE_SIZE / su.block_size) {
++		return EINVAL;
++	}
++	uint8_t cdb[10] = {
++		write ? 0x2au : 0x28u, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return sweet_ufs_scsi(cdb, sizeof(cdb), count * su.block_size, write);
++}
++
++static int
++sweet_ufs_read_capacity(void)
++{
++	uint8_t cdb[10] = { 0x25 };
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = sweet_ufs_scsi(cdb, sizeof(cdb), 8, false);
++	if (error) {
++		return error;
++	}
++	uint32_t last = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
++	    ((uint32_t)b[2] << 8) | b[3];
++	uint32_t block_size = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
++	    ((uint32_t)b[6] << 8) | b[7];
++	if (block_size < DEV_BSIZE || block_size > 4096 || (block_size & (block_size - 1u))) {
++		printf("SWEET UFS: invalid logical block size %u\n", block_size);
++		return ENXIO;
++	}
++	su.block_size = block_size;
++	su.device_blocks = (uint64_t)last + 1u;
++	printf("SWEET UFS: capacity %llu blocks x %u bytes\n", su.device_blocks, su.block_size);
++	return 0;
++}
++
++static int
++sweet_ufs_find_partition(const char *want)
++{
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = sweet_ufs_transfer_blocks(1, 1, false);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (entry_lba < 2 || entry_lba >= su.device_blocks || esz < 128 ||
++	    nent == 0 || nent > BOUNCE_SIZE / esz) {
++		printf("SWEET UFS: invalid GPT array %llu %u x %u\n", entry_lba, nent, esz);
++		return ENXIO;
++	}
++	uint32_t blocks = (nent * esz + su.block_size - 1u) / su.block_size;
++	error = sweet_ufs_transfer_blocks(entry_lba, blocks, false);
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		uint8_t *entry = b + i * esz;
++		char name[37];
++		unsigned int c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(entry[56 + 2 * c] | entry[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, entry + 32, 8);
++		memcpy(&last, entry + 40, 8);
++		if (last < first || last >= su.device_blocks) {
++			return ENXIO;
++		}
++		su.first_block = first;
++		su.nblocks = last - first + 1;
++		printf("SWEET UFS: GPT \"%s\" first %llu blocks %llu\n",
++		    want, su.first_block, su.nblocks);
++		return 0;
++	}
++	printf("SWEET UFS: GPT partition \"%s\" not found\n", want);
++	return ENOENT;
++}
++
++static int
++sweet_ufs_take_over_host(void)
++{
++	uint32_t result = 0xff, value = 0;
++	int error;
++	int refclk = 1, recovery = 1, cold = 0, mphy_vendor = 0, writable = 0;
++	PE_parse_boot_argn("ufs_refclk", &refclk, sizeof(refclk));
++	PE_parse_boot_argn("ufs_recovery", &recovery, sizeof(recovery));
++	PE_parse_boot_argn("ufs_cold", &cold, sizeof(cold));
++	PE_parse_boot_argn("ufs_mphy_vendor", &mphy_vendor, sizeof(mphy_vendor));
++	PE_parse_boot_argn("ufswrite", &writable, sizeof(writable));
++	su.writable = writable != 0;
++
++	sweet_ufs_ungate_clocks();
++	if (mphy_vendor) {
++		sweet_ufs_mphy_active();
++	}
++	if (refclk) {
++		error = sweet_ufs_refclk_enable();
++		if (error) {
++			UFS_MARK('U', '0', '2', '0', error);
++			return error;
++		}
++	}
++	if (cold) {
++		error = sweet_ufs_cold_init();
++		if (error) {
++			UFS_MARK('U', '0', '2', '1', error);
++			return error;
++		}
++	}
++
++	uint32_t hce = sweet_ufs_rd(REG_HCE);
++	uint32_t hcs = sweet_ufs_rd(REG_HCS);
++	printf("SWEET UFS: HCE %08x HCS %08x UECPA %08x UECDL %08x HW %08x\n",
++	    hce, hcs, sweet_ufs_rd(REG_UECPA), sweet_ufs_rd(REG_UECDL),
++	    sweet_ufs_rd(REG_MTK_HW_VER));
++	UFS_MARK('U', '0', '3', '0', hce);
++	UFS_MARK('U', '0', '3', '1', hcs);
++	if (!(hce & 1u) || !(hcs & HCS_UICRDY)) {
++		return ENXIO;
++	}
++
++	error = sweet_ufs_uic(UIC_DME_PEER_GET, PA_PWRMODE << 16, &result, &value);
++	printf("SWEET UFS: peer PWRMODE result %02x value %08x\n", result, value);
++	UFS_MARK('U', '0', '4', '0', result);
++	if ((error || result != 0) && recovery) {
++		uint32_t ignored;
++		(void)sweet_ufs_uic(UIC_DME_RESET, 0, &ignored, &ignored);
++		sweet_ufs_delay_us(5000);
++		(void)sweet_ufs_uic(UIC_DME_LINK_STARTUP, 0, &ignored, &ignored);
++		sweet_ufs_delay_us(20000);
++		error = sweet_ufs_uic(UIC_DME_PEER_GET, PA_PWRMODE << 16, &result, &value);
++		printf("SWEET UFS: recovered peer PWRMODE result %02x value %08x HCS %08x\n",
++		    result, value, sweet_ufs_rd(REG_HCS));
++		UFS_MARK('U', '0', '4', '1', result);
++	}
++	if (error || result != 0 || !(sweet_ufs_rd(REG_HCS) & HCS_DP)) {
++		return ENXIO;
++	}
++
++	sweet_ufs_wr(REG_IE, 0u);
++	sweet_ufs_wr(REG_IS, sweet_ufs_rd(REG_IS));
++	sweet_ufs_wr(REG_UTRLRSR, 0u);
++	uint64_t list = su.dma_pa + DMA_UTRL;
++	sweet_ufs_wr(REG_UTRLBA, (uint32_t)list);
++	sweet_ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
++	sweet_ufs_wr(REG_UTRLRSR, 1u);
++	for (unsigned int i = 0; i < 1000u && !(sweet_ufs_rd(REG_HCS) & HCS_UTRLRDY); i++) {
++		sweet_ufs_delay_us(100);
++	}
++	if (sweet_ufs_rd(REG_UTRLBA) != (uint32_t)list ||
++	    sweet_ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
++	    !(sweet_ufs_rd(REG_HCS) & HCS_UTRLRDY)) {
++		UFS_MARK('U', '0', '5', '0', sweet_ufs_rd(REG_HCS));
++		return EIO;
++	}
++	UFS_MARK('U', '0', '5', '1', list);
++	return 0;
++}
++
++static int
++sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!su.ready) {
++		return ENXIO;
++	}
++	return (flags & FWRITE) && !su.writable ? EROFS : 0;
++}
++
++static int
++sweet_ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++sweet_ufs_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = su.nblocks * su.block_size;
++	bool write = (buf_flags(bp) & B_WRITE) != 0;
++
++	buf_setresid(bp, count);
++	if (!su.ready) {
++		error = ENXIO;
++		goto done;
++	}
++	if (write && !su.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / su.block_size;
++		uint32_t skip = (uint32_t)(pos % su.block_size);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + su.block_size - 1u) / su.block_size;
++		uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
++		if (!write) {
++			error = sweet_ufs_transfer_blocks(su.first_block + lba, blocks, false);
++			if (!error) {
++				memcpy(vaddr + done, bounce + skip, want);
++			}
++		} else {
++			if (skip || (want % su.block_size)) {
++				error = sweet_ufs_transfer_blocks(su.first_block + lba, blocks, false);
++			}
++			if (!error) {
++				memcpy(bounce + skip, vaddr + done, want);
++				error = sweet_ufs_transfer_blocks(su.first_block + lba, blocks, true);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = su.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > su.block_size || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		su.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = su.block_size;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = su.nblocks * su.block_size / su.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = su.writable;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / su.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = su.writable ? BOUNCE_SIZE / su.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_ufs_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_ufs_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++sweet_ufs_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_ufs_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++sweet_ufs_psize(__unused dev_t dev)
++{
++	return su.ready ? (int)MIN(su.nblocks * su.block_size / su.secsize, INT_MAX) : -1;
++}
++
++static int
++sweet_ufs_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_ufs_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
++}
++
++static int
++sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
++}
++
++static const struct bdevsw sweet_ufs_bdevsw = {
++	.d_open     = sweet_ufs_open,
++	.d_close    = sweet_ufs_close,
++	.d_strategy = sweet_ufs_strategy,
++	.d_ioctl    = sweet_ufs_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_ufs_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw sweet_ufs_cdevsw = {
++	.d_open       = sweet_ufs_open,
++	.d_close      = sweet_ufs_close,
++	.d_read       = sweet_ufs_read,
++	.d_write      = sweet_ufs_write,
++	.d_ioctl      = sweet_ufs_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++sweet_ufs_init(void)
++{
++	DTEntry node;
++	uint64_t pa = 0, hci_pa = 0;
++	uint32_t lun = 0;
++	char want[64] = "userdata";
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess) {
++		printf("SWEET UFS: no /sweet-ufs node\n");
++		return ENXIO;
++	}
++	if ((error = sweet_ufs_map_reg(node, "reg", &su.regs, &hci_pa)) ||
++	    (error = sweet_ufs_map_reg(node, "mphy-reg", &su.mphy, &pa)) ||
++	    (error = sweet_ufs_map_reg(node, "lk-phy-reg", &su.lk_phy, &pa)) ||
++	    (error = sweet_ufs_map_reg(node, "ao-cfg-reg", &su.ao_cfg, &pa)) ||
++	    (error = sweet_ufs_map_reg(node, "pdn-cfg-reg", &su.pdn_cfg, &pa)) ||
++	    (error = sweet_ufs_map_reg(node, "topckgen-reg", &su.topckgen, &pa)) ||
++	    (error = sweet_ufs_map_reg(node, "pmif-reg", &su.pmif, &pa)) ||
++	    (error = sweet_ufs_map_reg(node, "spmimst-reg", &su.spmimst, &pa)) ||
++	    (error = sweet_ufs_map_reg(node, "srclken-reg", &su.srclken, &pa)) ||
++	    (error = sweet_ufs_map_u32(node, "ufs-lun", &lun)) ||
++	    (error = sweet_ufs_map_u32(node, "ufs-refclk-slave", &su.refclk_slave)) ||
++	    (error = sweet_ufs_map_u32(node, "ufs-refclk-reg", &su.refclk_reg)) ||
++	    (error = sweet_ufs_map_u32(node, "ufs-refclk-en-bit", &su.refclk_en_bit)) ||
++	    (error = sweet_ufs_map_u32(node, "ufs-srclken-index", &su.srclken_index))) {
++		printf("SWEET UFS: incomplete device tree (%d)\n", error);
++		return error;
++	}
++	su.lun = (uint8_t)lun;
++	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	su.dma_pa = ptoa_64(pn);
++	su.secsize = DEV_BSIZE;
++	UFS_MARK('U', '0', '0', '0', hci_pa);
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = sweet_ufs_take_over_host();
++	if (!error) {
++		uint8_t tur[6] = { 0 };
++		for (int i = 0; i < 8 && (error = sweet_ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			sweet_ufs_delay_us(2000);
++		}
++	}
++	if (!error) {
++		error = sweet_ufs_read_capacity();
++		UFS_MARK('U', '0', '6', '0', su.block_size);
++	}
++	if (!error) {
++		error = sweet_ufs_find_partition(want);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		UFS_MARK('U', '0', '9', '9', error);
++		return error;
++	}
++
++	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
++	if (su.bmajor < 0) {
++		return ENXIO;
++	}
++	su.cmajor = cdevsw_add_with_bdev(-1, &sweet_ufs_cdevsw, su.bmajor);
++	if (su.cmajor < 0) {
++		return ENXIO;
++	}
++	su.bdev = makedev(su.bmajor, 0);
++	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
++	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
++	su.ready = true;
++	UFS_MARK('U', '0', '9', '0', 1);
++	printf("SWEET UFS: \"%s\" LUN %u first %llu, %llu MiB, %s\n",
++	    want, su.lun, su.first_block, su.nblocks * su.block_size >> 20,
++	    su.writable ? "read-write" : "read-only");
++	return 0;
++}
++
++int sweet_ufs_rootdev(dev_t *dev);
++
++int
++sweet_ufs_rootdev(dev_t *dev)
++{
++	if (!su.ready) {
++		int error = sweet_ufs_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = su.bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
