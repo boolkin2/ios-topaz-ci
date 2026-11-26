@@ -1,0 +1,312 @@
+diff --git a/osfmk/conf/files b/osfmk/conf/files
+--- a/osfmk/conf/files
++++ b/osfmk/conf/files
+@@ -170,6 +170,7 @@
+ osfmk/kern/smr.c		standard
+ osfmk/kern/stack.c			standard
+ osfmk/kern/startup.c			standard
++osfmk/kern/sweet_usb_log.c		standard
+ osfmk/kern/sync_sema.c		standard
+ osfmk/kern/syscall_subr.c		standard
+ osfmk/kern/syscall_sw.c		standard
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -176,6 +176,10 @@
+ #include <i386/pmCPU.h>
+ static void             kernel_bootstrap_thread(void);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern void sweet_usb_log_start(void);
++#endif
++
+ static void             load_context(
+ 	thread_t        thread);
+ 
+@@ -730,6 +734,7 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_wdt_start();
++	sweet_usb_log_start();
+ 	sweet_fb_refresh_start();
+ #endif
+ 
+diff --git a/osfmk/kern/sweet_usb_log.c b/osfmk/kern/sweet_usb_log.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/kern/sweet_usb_log.c
+@@ -0,0 +1,274 @@
++#include <arm/machine_routines.h>
++#include <arm/pmap.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <mach/clock_types.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#define SWEET_USB_MAC_PA       0x11201000UL
++#define SWEET_USB_MAC_SIZE     0x1000UL
++#define SWEET_USB_CACHELINE    64U
++#define SWEET_USB_GPD_COUNT    8U
++#define SWEET_USB_TX_SIZE      2048U
++#define SWEET_USB_FRAME_SIZE   1600U
++#define SWEET_USB_CHUNK        1400U
++#define SWEET_USB_LOG_PORT     6970U
++#define SWEET_PMSG_KVA         0xFFFFFE0200130000UL
++#define SWEET_PMSG_SIZE        0x40000U
++#define SWEET_PMSG_DATA_OFF    12U
++#define SWEET_XLOG_MAGIC       0x474f4c58U
++
++#define SWEET_USB_TXCSR(n)     (0x510u + ((n) - 1u) * 0x10u)
++#define SWEET_USB_TXSAR(n)     (0x514u + ((n) - 1u) * 0x10u)
++#define SWEET_USB_TXCPR(n)     (0x518u + ((n) - 1u) * 0x10u)
++#define SWEET_USB_TXHIAR(n)    (0x480u + (n) * 4u)
++#define SWEET_USB_TXnCSR0(n)   (0x110u + ((n) - 1u) * 0x10u)
++#define SWEET_USB_QMU_START    1u
++#define SWEET_USB_QMU_ACTIVE   (1u << 15)
++
++struct sweet_usb_gpd {
++	uint32_t dw0;
++	uint32_t next;
++	uint32_t buf;
++	uint32_t dw3;
++};
++
++static struct sweet_usb_gpd sweet_usb_gpd_ring[SWEET_USB_GPD_COUNT] __attribute__((aligned(64)));
++static unsigned char sweet_usb_tx_buf[SWEET_USB_TX_SIZE] __attribute__((aligned(64)));
++static unsigned char sweet_usb_frame[SWEET_USB_FRAME_SIZE] __attribute__((aligned(64)));
++static volatile uint32_t *sweet_usb_mac;
++static unsigned int sweet_usb_sent;
++
++static inline uint32_t
++sweet_usb_rd(uint32_t off)
++{
++	return sweet_usb_mac[off >> 2];
++}
++
++static inline void
++sweet_usb_wr(uint32_t off, uint32_t value)
++{
++	sweet_usb_mac[off >> 2] = value;
++}
++
++static inline void
++sweet_usb_civac(vm_offset_t addr)
++{
++	__asm__ volatile("dc civac, %0" :: "r"(addr) : "memory");
++}
++
++static inline void
++sweet_usb_ivac(vm_offset_t addr)
++{
++	__asm__ volatile("dc ivac, %0" :: "r"(addr) : "memory");
++}
++
++static void
++sweet_usb_cache_clean(vm_offset_t addr, vm_size_t size)
++{
++	vm_offset_t end = addr + size;
++	for (vm_offset_t p = addr & ~(vm_offset_t)(SWEET_USB_CACHELINE - 1u);
++	    p < end; p += SWEET_USB_CACHELINE) {
++		sweet_usb_civac(p);
++	}
++}
++
++static void
++sweet_usb_delay_us(uint32_t usec)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(usec, NSEC_PER_USEC, &deadline);
++	clock_delay_until(deadline);
++}
++
++static void
++sweet_usb_put32(unsigned char *p, uint32_t value)
++{
++	p[0] = (unsigned char)value;
++	p[1] = (unsigned char)(value >> 8);
++	p[2] = (unsigned char)(value >> 16);
++	p[3] = (unsigned char)(value >> 24);
++}
++
++static uint16_t
++sweet_usb_ip_checksum(const unsigned char *p, unsigned int size)
++{
++	uint32_t sum = 0;
++	for (unsigned int i = 0; i + 1u < size; i += 2u) {
++		sum += ((uint32_t)p[i] << 8) | p[i + 1u];
++	}
++	if (size & 1u) {
++		sum += (uint32_t)p[size - 1u] << 8;
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffffu) + (sum >> 16);
++	}
++	return (uint16_t)(~sum);
++}
++
++static int
++sweet_usb_tx_frame(const unsigned char *frame, unsigned int frame_len)
++{
++	unsigned int total = 44u + frame_len;
++	vm_offset_t ring_va = (vm_offset_t)sweet_usb_gpd_ring;
++	vm_offset_t buf_va = (vm_offset_t)sweet_usb_tx_buf;
++	pmap_paddr_t ring_pa = kvtophys(ring_va);
++	pmap_paddr_t buf_pa = kvtophys(buf_va);
++
++	if (sweet_usb_mac == NULL || frame_len == 0 || total > SWEET_USB_TX_SIZE ||
++	    ring_pa == 0 || buf_pa == 0 || ring_pa > UINT32_MAX || buf_pa > UINT32_MAX) {
++		return -1;
++	}
++
++	for (unsigned int i = 0; i < 44u; i++) {
++		sweet_usb_tx_buf[i] = 0;
++	}
++	sweet_usb_put32(sweet_usb_tx_buf, 1u);
++	sweet_usb_put32(sweet_usb_tx_buf + 4u, total);
++	sweet_usb_put32(sweet_usb_tx_buf + 8u, 36u);
++	sweet_usb_put32(sweet_usb_tx_buf + 12u, frame_len);
++	for (unsigned int i = 0; i < frame_len; i++) {
++		sweet_usb_tx_buf[44u + i] = frame[i];
++	}
++
++	if (sweet_usb_rd(SWEET_USB_TXCSR(1)) & SWEET_USB_QMU_ACTIVE) {
++		sweet_usb_wr(SWEET_USB_TXCSR(1), 4u);
++		for (unsigned int i = 0; i < 200u &&
++		    (sweet_usb_rd(SWEET_USB_TXCSR(1)) & SWEET_USB_QMU_ACTIVE); i++) {
++			sweet_usb_delay_us(10u);
++		}
++	}
++	sweet_usb_wr(SWEET_USB_TXnCSR0(1), sweet_usb_rd(SWEET_USB_TXnCSR0(1)) | (1u << 20));
++	for (unsigned int i = 0; i < SWEET_USB_GPD_COUNT; i++) {
++		sweet_usb_gpd_ring[i].dw0 = 0;
++		sweet_usb_gpd_ring[i].buf = 0;
++		sweet_usb_gpd_ring[i].dw3 = 0;
++		sweet_usb_gpd_ring[i].next = (uint32_t)(ring_pa +
++		    ((i + 1u) % SWEET_USB_GPD_COUNT) * sizeof(struct sweet_usb_gpd));
++	}
++	sweet_usb_gpd_ring[0].buf = (uint32_t)buf_pa;
++	sweet_usb_gpd_ring[0].dw3 = total;
++	sweet_usb_cache_clean(buf_va, total);
++	sweet_usb_cache_clean(ring_va, sizeof(sweet_usb_gpd_ring));
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_usb_gpd_ring[0].dw0 = (1u << 7) | 1u;
++	sweet_usb_cache_clean(ring_va, SWEET_USB_CACHELINE);
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	sweet_usb_wr(SWEET_USB_TXSAR(1), (uint32_t)ring_pa);
++	sweet_usb_wr(SWEET_USB_TXHIAR(1), (sweet_usb_rd(SWEET_USB_TXHIAR(1)) & ~0xfu) |
++	    ((uint32_t)(ring_pa >> 32) & 0xfu));
++	sweet_usb_wr(SWEET_USB_TXnCSR0(1), sweet_usb_rd(SWEET_USB_TXnCSR0(1)) | (1u << 29));
++	if (!(sweet_usb_rd(SWEET_USB_TXCSR(1)) & SWEET_USB_QMU_ACTIVE)) {
++		sweet_usb_wr(SWEET_USB_TXCSR(1), SWEET_USB_QMU_START);
++	} else {
++		sweet_usb_wr(SWEET_USB_TXCSR(1), 2u);
++	}
++
++	for (unsigned int i = 0; i < 4000u; i++) {
++		sweet_usb_ivac(ring_va);
++		if ((sweet_usb_gpd_ring[0].dw0 & 1u) == 0) {
++			return 0;
++		}
++		sweet_usb_delay_us(50u);
++	}
++	sweet_usb_wr(SWEET_USB_TXCSR(1), 4u);
++	return -1;
++}
++
++static int
++sweet_usb_send_chunk(uint32_t offset, uint32_t total, const unsigned char *payload, uint32_t length)
++{
++	const unsigned char tx_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++	const unsigned char src_ip[4] = { 192, 168, 137, 1 };
++	const unsigned char dst_ip[4] = { 192, 168, 137, 2 };
++	unsigned char *frame = sweet_usb_frame;
++	unsigned int frame_len = 58u + length;
++	unsigned int udp_len = 8u + 16u + length;
++
++	for (unsigned int i = 0; i < 6u; i++) {
++		frame[i] = 0xffu;
++		frame[6u + i] = tx_mac[i];
++	}
++	frame[12] = 0x08u;
++	frame[13] = 0x00u;
++	for (unsigned int i = 0; i < 20u; i++) {
++		frame[14u + i] = 0;
++	}
++	frame[14] = 0x45u;
++	frame[16] = (unsigned char)((20u + udp_len) >> 8);
++	frame[17] = (unsigned char)(20u + udp_len);
++	frame[22] = 64u;
++	frame[23] = 17u;
++	for (unsigned int i = 0; i < 4u; i++) {
++		frame[26u + i] = src_ip[i];
++		frame[30u + i] = dst_ip[i];
++	}
++	{
++		uint16_t sum = sweet_usb_ip_checksum(frame + 14u, 20u);
++		frame[24] = (unsigned char)(sum >> 8);
++		frame[25] = (unsigned char)sum;
++	}
++	frame[34] = (unsigned char)(SWEET_USB_LOG_PORT >> 8);
++	frame[35] = (unsigned char)SWEET_USB_LOG_PORT;
++	frame[36] = (unsigned char)(SWEET_USB_LOG_PORT >> 8);
++	frame[37] = (unsigned char)SWEET_USB_LOG_PORT;
++	frame[38] = (unsigned char)(udp_len >> 8);
++	frame[39] = (unsigned char)udp_len;
++	frame[40] = 0;
++	frame[41] = 0;
++	sweet_usb_put32(frame + 42u, SWEET_XLOG_MAGIC);
++	sweet_usb_put32(frame + 46u, offset);
++	sweet_usb_put32(frame + 50u, total);
++	sweet_usb_put32(frame + 54u, length);
++	for (uint32_t i = 0; i < length; i++) {
++		frame[58u + i] = payload[i];
++	}
++	return sweet_usb_tx_frame(frame, frame_len);
++}
++
++static void
++sweet_usb_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	volatile uint32_t *pmsg = (volatile uint32_t *)SWEET_PMSG_KVA;
++	sweet_usb_mac = ml_io_map(SWEET_USB_MAC_PA, SWEET_USB_MAC_SIZE);
++	if (sweet_usb_mac == NULL || pmsg[0] != 0x43474244u) {
++		return;
++	}
++	for (;;) {
++		uint32_t used = pmsg[2];
++		if (used > SWEET_PMSG_SIZE - SWEET_PMSG_DATA_OFF) {
++			used = SWEET_PMSG_SIZE - SWEET_PMSG_DATA_OFF;
++		}
++		if (sweet_usb_sent > used) {
++			sweet_usb_sent = 0;
++		}
++		if (sweet_usb_sent < used) {
++			uint32_t length = used - sweet_usb_sent;
++			const unsigned char *payload = (const unsigned char *)(SWEET_PMSG_KVA +
++			    SWEET_PMSG_DATA_OFF + sweet_usb_sent);
++			if (length > SWEET_USB_CHUNK) {
++				length = SWEET_USB_CHUNK;
++			}
++			if (sweet_usb_send_chunk(sweet_usb_sent, used, payload, length) == 0) {
++				sweet_usb_sent += length;
++			} else {
++				sweet_usb_delay_us(1000u);
++			}
++		} else {
++			sweet_usb_delay_us(10000u);
++		}
++	}
++}
++
++void
++sweet_usb_log_start(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(sweet_usb_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
