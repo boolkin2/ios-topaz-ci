@@ -1,0 +1,100 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -59,6 +59,7 @@
+ #define IS_FATAL_MASK       (1u << 11) | (1u << 16) | (1u << 17) | (1u << 18)
+ 
+ #define UIC_DME_GET         0x01
++#define UIC_DME_SET         0x02
+ #define UIC_DME_PEER_GET    0x03
+ #define UIC_DME_ENABLE      0x12
+ #define UIC_DME_RESET       0x14
+@@ -66,6 +67,10 @@
+ #define UIC_DME_HIBER_EXIT  0x18
+ #define UIC_RESULT_MASK     0xffu
+ #define PA_PWRMODE          0x1571u
++#define PA_LOCAL_TX_LCC_ENABLE       0x155eu
++#define VS_SAVEPOWERCONTROL          0xd0a6u
++#define VS_UNIPROPOWERDOWNCONTROL    0xd0a8u
++#define VS_SAVEPOWER_DEEP_STALL      (1u << 6)
+ 
+ #define PMIF_SWINF2_STA     0x8a8
+ #define PMIF_SWINF2_WDATA   0x884
+@@ -414,14 +419,15 @@
+ }
+ 
+ static int
+-sweet_ufs_uic(uint32_t opcode, uint32_t arg1, uint32_t *result, uint32_t *value)
++sweet_ufs_uic_arg3(uint32_t opcode, uint32_t arg1, uint32_t arg3,
++    uint32_t *result, uint32_t *value)
+ {
+ 	uint64_t deadline;
+ 	uint32_t status = 0;
+ 
+ 	sweet_ufs_wr(REG_UICARG1, arg1);
+ 	sweet_ufs_wr(REG_UICARG2, 0u);
+-	sweet_ufs_wr(REG_UICARG3, 0u);
++	sweet_ufs_wr(REG_UICARG3, arg3);
+ 	sweet_ufs_wr(REG_UICCMD, opcode & 0xffu);
+ 	nanoseconds_to_absolutetime(UIC_TIMEOUT_NS, &deadline);
+ 	deadline += mach_absolute_time();
+@@ -440,6 +446,45 @@
+ 		}
+ 		sweet_ufs_delay_us(10);
+ 	}
++}
++
++static int
++sweet_ufs_uic(uint32_t opcode, uint32_t arg1, uint32_t *result, uint32_t *value)
++{
++	return sweet_ufs_uic_arg3(opcode, arg1, 0u, result, value);
++}
++
++/* MT6983 vendor PRE_CHANGE sequence, after DME_RESET and before training. */
++static int
++sweet_ufs_pre_link(void)
++{
++	uint32_t result, value, ignore;
++	int error;
++
++	error = sweet_ufs_uic_arg3(UIC_DME_SET, VS_UNIPROPOWERDOWNCONTROL << 16,
++	    0u, &result, &ignore);
++	UFS_MARK('U', '0', '4', '6', ((uint32_t)error << 8) | result);
++	if (error || result) {
++		return error ? error : EIO;
++	}
++
++	error = sweet_ufs_uic_arg3(UIC_DME_SET, PA_LOCAL_TX_LCC_ENABLE << 16,
++	    0u, &result, &ignore);
++	UFS_MARK('U', '0', '4', '7', ((uint32_t)error << 8) | result);
++	if (error || result) {
++		return error ? error : EIO;
++	}
++
++	error = sweet_ufs_uic(UIC_DME_GET, VS_SAVEPOWERCONTROL << 16, &result, &value);
++	UFS_MARK('U', '0', '4', '8', ((uint32_t)error << 8) | result);
++	if (error || result) {
++		return error ? error : EIO;
++	}
++
++	error = sweet_ufs_uic_arg3(UIC_DME_SET, VS_SAVEPOWERCONTROL << 16,
++	    value & ~VS_SAVEPOWER_DEEP_STALL, &result, &ignore);
++	UFS_MARK('U', '0', '4', '9', ((uint32_t)error << 8) | result);
++	return error ? error : (result ? EIO : 0);
+ }
+ 
+ static int
+@@ -670,7 +715,14 @@
+ 		UFS_MARK('U', '0', '4', '2',
+ 		    ((uint32_t)recovery_error << 8) | recovery_result);
+ 		UFS_MARK('U', '0', '4', '3', sweet_ufs_rd(REG_HCS));
++		if (recovery_error || recovery_result) {
++			return recovery_error ? recovery_error : EIO;
++		}
+ 		sweet_ufs_delay_us(5000);
++		recovery_error = sweet_ufs_pre_link();
++		if (recovery_error) {
++			return recovery_error;
++		}
+ 		recovery_error = sweet_ufs_uic(UIC_DME_LINK_STARTUP, 0,
+ 		    &recovery_result, &recovery_value);
+ 		UFS_MARK('U', '0', '4', '4',
