@@ -46,7 +46,7 @@ jobs:
     # Xcode 15.x any more. macos-15 has Xcode 16.0-16.4 (16.4 default) + 26.x.
     # Xcode 16's iig emits IORPC.kernelContent, which xnu-8796 lacks, so patch
     # 0084-iig-kernelcontent adds that field to xnu-8796 instead.
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
