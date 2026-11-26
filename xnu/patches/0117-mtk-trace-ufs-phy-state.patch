@@ -1,0 +1,94 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -30,6 +30,7 @@
+ 
+ #define REG_IS              0x20
+ #define REG_IE              0x24
++#define REG_AHIT            0x18
+ #define REG_HCS             0x30
+ #define REG_HCE             0x34
+ #define REG_UECPA           0x38
+@@ -49,6 +50,9 @@
+ #define REG_XOUFS           0x140
+ #define REG_REFCLK          0x144
+ #define REG_MTK_HW_VER      0x2240
++#define REG_MTK_DEBUG_SEL   0x22c0
++#define REG_MTK_PROBE       0x22c8
++#define REG_MTK_DEBUG_B0    0x22d0
+ 
+ #define HCS_DP              (1u << 0)
+ #define HCS_UTRLRDY         (1u << 1)
+@@ -662,6 +666,49 @@
+ 	return ENOENT;
+ }
+ 
++/* Read vendor link state, restoring the debug mux rather than changing PHY. */
++static uint32_t
++sweet_ufs_read_link_probe(void)
++{
++	const bool wide = ((sweet_ufs_rd(REG_MTK_HW_VER) >> 16) & 0xffu) >= 0x36u;
++	const uint32_t sel = sweet_ufs_rd(REG_MTK_DEBUG_SEL);
++	uint32_t b0 = 0, b1 = 0, b2 = 0, b3 = 0, probe;
++
++	if (wide) {
++		b0 = sweet_ufs_rd(REG_MTK_DEBUG_B0);
++		b1 = sweet_ufs_rd(REG_MTK_DEBUG_B0 + 4u);
++		b2 = sweet_ufs_rd(REG_MTK_DEBUG_B0 + 8u);
++		b3 = sweet_ufs_rd(REG_MTK_DEBUG_B0 + 12u);
++		sweet_ufs_wr(REG_MTK_DEBUG_SEL, 0x820820u);
++		for (unsigned int i = 0; i < 4; i++) {
++			sweet_ufs_wr(REG_MTK_DEBUG_B0 + 4u * i, 0x55555555u * i);
++		}
++	} else {
++		sweet_ufs_wr(REG_MTK_DEBUG_SEL, 0x20u);
++	}
++	probe = sweet_ufs_rd(REG_MTK_PROBE);
++	if (wide) {
++		sweet_ufs_wr(REG_MTK_DEBUG_B0, b0);
++		sweet_ufs_wr(REG_MTK_DEBUG_B0 + 4u, b1);
++		sweet_ufs_wr(REG_MTK_DEBUG_B0 + 8u, b2);
++		sweet_ufs_wr(REG_MTK_DEBUG_B0 + 12u, b3);
++	}
++	sweet_ufs_wr(REG_MTK_DEBUG_SEL, sel);
++	return probe;
++}
++
++static void
++sweet_ufs_trace_link(char stage)
++{
++	UFS_MARK('L', 'S', 'P', stage, sweet_ufs_read_link_probe());
++	UFS_MARK('A', 'H', 'I', stage, sweet_ufs_rd(REG_AHIT));
++	UFS_MARK('E', 'P', 'A', stage, sweet_ufs_rd(REG_UECPA));
++	UFS_MARK('E', 'D', 'L', stage, sweet_ufs_rd(REG_UECDL));
++	UFS_MARK('X', 'O', 'U', stage, sweet_ufs_rd(REG_XOUFS));
++	UFS_MARK('M', 'P', 'G', stage, sweet_ufs_rd32(su.mphy, MP_GLB_DIG_8C));
++	UFS_MARK('M', 'P', 'L', stage, sweet_ufs_rd32(su.lk_phy, 0x208c));
++}
++
+ static int
+ sweet_ufs_take_over_host(void)
+ {
+@@ -705,6 +752,7 @@
+ 		return ENXIO;
+ 	}
+ 
++	sweet_ufs_trace_link('0');
+ 	error = sweet_ufs_uic(UIC_DME_PEER_GET, PA_PWRMODE << 16, &result, &value);
+ 	printf("SWEET UFS: peer PWRMODE result %02x value %08x\n", result, value);
+ 	UFS_MARK('U', '0', '4', '0', result);
+@@ -715,6 +763,7 @@
+ 		UFS_MARK('U', '0', '4', '2',
+ 		    ((uint32_t)recovery_error << 8) | recovery_result);
+ 		UFS_MARK('U', '0', '4', '3', sweet_ufs_rd(REG_HCS));
++		sweet_ufs_trace_link('1');
+ 		if (recovery_error || recovery_result) {
+ 			return recovery_error ? recovery_error : EIO;
+ 		}
+@@ -728,6 +777,7 @@
+ 		UFS_MARK('U', '0', '4', '4',
+ 		    ((uint32_t)recovery_error << 8) | recovery_result);
+ 		UFS_MARK('U', '0', '4', '5', sweet_ufs_rd(REG_HCS));
++		sweet_ufs_trace_link('2');
+ 		sweet_ufs_delay_us(20000);
+ 		error = sweet_ufs_uic(UIC_DME_PEER_GET, PA_PWRMODE << 16, &result, &value);
+ 		printf("SWEET UFS: recovered peer PWRMODE result %02x value %08x HCS %08x\n",
