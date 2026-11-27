@@ -1,0 +1,66 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -75,6 +75,12 @@
+ #define UIC_DME_HIBER_EXIT  0x18
+ #define UIC_RESULT_MASK     0xffu
+ #define PA_PWRMODE          0x1571u
++#define PA_TXPWRSTATUS       0x1567u
++#define PA_RXPWRSTATUS       0x1582u
++#define PA_TXGEAR            0x1568u
++#define PA_RXGEAR            0x1583u
++#define PA_ACTIVETXDATALANES 0x1560u
++#define PA_ACTIVERXDATALANES 0x1580u
+ #define PA_LOCAL_TX_LCC_ENABLE       0x155eu
+ #define VS_SAVEPOWERCONTROL          0xd0a6u
+ #define VS_UNIPROPOWERDOWNCONTROL    0xd0a8u
+@@ -812,6 +818,39 @@
+ 	UFS_MARK('M', 'P', 'L', stage, sweet_ufs_rd32(su.lk_phy, 0x208c));
+ }
+ 
++/* Local PA observations only; never infer or write a target power mode. */
++static int
++sweet_ufs_trace_pa_mode(void)
++{
++	static const uint32_t attrs[] = {
++		PA_PWRMODE, PA_TXPWRSTATUS, PA_RXPWRSTATUS, PA_TXGEAR,
++		PA_RXGEAR, PA_ACTIVETXDATALANES, PA_ACTIVERXDATALANES
++	};
++	uint32_t status = sweet_ufs_rd(REG_IS);
++	UFS_MARK('P', 'I', 'S', '0', status);
++	UFS_MARK('P', 'H', 'C', '0', sweet_ufs_rd(REG_HCS));
++	if (status & (IS_UIC_COMPLETE | IS_UIC_ERROR | IS_FATAL_MASK)) {
++		return EBUSY; /* Do not attribute a pending old event to a new GET. */
++	}
++	for (unsigned int i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
++		uint32_t result = 0xffu, value = 0;
++		int error;
++		if (!(sweet_ufs_rd(REG_HCS) & HCS_UICRDY)) {
++			UFS_MARK('P', '0' + i, 'E', 'R', ENXIO);
++			return ENXIO;
++		}
++		error = sweet_ufs_uic(UIC_DME_GET, attrs[i] << 16, &result, &value);
++		UFS_MARK('P', '0' + i, 'E', 'R', error);
++		UFS_MARK('P', '0' + i, 'R', 'C', result);
++		UFS_MARK('P', '0' + i, 'V', 'L', value);
++		if (error || result) {
++			return error ? error : EIO;
++		}
++	}
++	UFS_MARK('P', 'D', 'O', 'N', 1u);
++	return 0;
++}
++
+ static int
+ sweet_ufs_take_over_host(void)
+ {
+@@ -855,6 +894,10 @@
+ 	}
+ 
+ 	sweet_ufs_trace_link('0');
++	error = sweet_ufs_trace_pa_mode();
++	if (error) {
++		return error;
++	}
+ 	error = sweet_ufs_uic(UIC_DME_PEER_GET, PA_PWRMODE << 16, &result, &value);
+ 	printf("SWEET UFS: peer PWRMODE result %02x value %08x\n", result, value);
+ 	UFS_MARK('U', '0', '4', '0', result);
