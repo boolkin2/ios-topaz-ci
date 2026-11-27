@@ -1,0 +1,87 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -435,12 +435,35 @@
+ 	return 0;
+ }
+ 
++/* Snapshot each ROC latch once before W1C. Only this precise startup event
++ * may precede UIC_COMMAND_COMPL; it is not proof that the link came up. */
++static bool
++sweet_ufs_link_reset_event(uint32_t status)
++{
++	uint32_t pa = sweet_ufs_rd(REG_UECPA);
++	uint32_t dl = sweet_ufs_rd(REG_UECDL);
++	uint32_t nl = sweet_ufs_rd(REG_UECN);
++	uint32_t tl = sweet_ufs_rd(REG_UECT);
++	uint32_t dme = sweet_ufs_rd(REG_UECDME);
++
++	UFS_MARK('L', 'I', 'S', 'R', status);
++	UFS_MARK('L', 'P', 'A', 'R', pa);
++	UFS_MARK('L', 'D', 'L', 'R', dl);
++	UFS_MARK('L', 'N', 'L', 'R', nl);
++	UFS_MARK('L', 'T', 'L', 'R', tl);
++	UFS_MARK('L', 'D', 'M', 'R', dme);
++	return pa == 0x80000010u &&
++	       !((dl | nl | tl | dme) & 0x80000000u);
++}
++
+ static int
+ sweet_ufs_uic_arg3(uint32_t opcode, uint32_t arg1, uint32_t arg3,
+     uint32_t *result, uint32_t *value)
+ {
+ 	uint64_t deadline;
+ 	uint32_t status = 0;
++	bool link_startup = opcode == UIC_DME_LINK_STARTUP;
++	bool link_reset_seen = false;
+ 
+ 	sweet_ufs_wr(REG_UICARG1, arg1);
+ 	sweet_ufs_wr(REG_UICARG2, 0u);
+@@ -450,6 +473,37 @@
+ 	deadline += mach_absolute_time();
+ 	for (;;) {
+ 		status = sweet_ufs_rd(REG_IS);
++		if (link_startup) {
++			if (status & (IS_FATAL_MASK)) {
++				if (status & IS_UIC_ERROR) {
++					(void)sweet_ufs_link_reset_event(status);
++				} else {
++					UFS_MARK('L', 'I', 'S', 'R', status);
++				}
++				sweet_ufs_wr(REG_IS, status);
++				*result = 0xffu;
++				*value = 0;
++				return EIO; /* Fatal wins even if completion is also set. */
++			}
++			if (status & IS_UIC_ERROR) {
++				bool reset_only = sweet_ufs_link_reset_event(status);
++				if (!reset_only || link_reset_seen) {
++					UFS_MARK('L', 'R', 'S', 'T', reset_only ? 2u : 0u);
++					sweet_ufs_wr(REG_IS, status);
++					*result = 0xffu;
++					*value = 0;
++					return EIO;
++				}
++				link_reset_seen = true;
++				UFS_MARK('L', 'R', 'S', 'T', 1u);
++				/* Do not acknowledge a not-yet-observed command completion. */
++				sweet_ufs_wr(REG_IS, IS_UIC_ERROR);
++				status &= ~IS_UIC_ERROR;
++			}
++			if (status & IS_UIC_COMPLETE) {
++				UFS_MARK('L', 'C', 'I', 'S', status);
++			}
++		}
+ 		if (status & (IS_UIC_COMPLETE | IS_UIC_ERROR | IS_FATAL_MASK)) {
+ 			sweet_ufs_wr(REG_IS, status);
+ 			*result = sweet_ufs_rd(REG_UICARG2) & UIC_RESULT_MASK;
+@@ -457,6 +511,10 @@
+ 			return status & IS_UIC_COMPLETE ? 0 : EIO;
+ 		}
+ 		if (mach_absolute_time() > deadline) {
++			if (link_startup) {
++				UFS_MARK('L', 'T', 'I', 'S', status);
++				UFS_MARK('L', 'T', 'H', 'C', sweet_ufs_rd(REG_HCS));
++			}
+ 			*result = 0xffu;
+ 			*value = 0;
+ 			return ETIMEDOUT;
