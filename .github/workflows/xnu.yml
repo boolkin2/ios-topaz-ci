@@ -27,8 +27,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  DXB_ARCHIVE_SHA256: b7bb00e624d8891091b2e78b20316efdb077b6ccef05863d768d38c5ecbb368f
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
@@ -53,9 +53,13 @@ jobs:
 
       - name: Fetch build script
         run: |
-          git init -q dxb
-          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
-          git -C dxb checkout -q FETCH_HEAD
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            --connect-timeout 15 --max-time 120 --output dxb-source.tgz \
+            "https://codeload.github.com/blacktop/darwin-xnu-build/tar.gz/$DXB_SHA"
+          printf '%s  %s\n' "$DXB_ARCHIVE_SHA256" dxb-source.tgz | shasum -a 256 -c -
+          mkdir -p dxb
+          tar -xzf dxb-source.tgz -C dxb --strip-components 1
+          test -s dxb/build.sh
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's.
           # The mt6983 minimal patch set carries no stage-*.sh scripts, so the
           # .sh glob must be allowed to match nothing instead of failing the step.
@@ -115,7 +119,12 @@ jobs:
 
       - name: Package build tree for local compiles
         if: always()
+        id: buildtree
         run: |
+          if [[ ! -d dxb/build/xnu.obj || ! -d dxb/fakeroot/usr/local/include || ! -d dxb/xnu ]]; then
+            echo "Skipping build tree archive: required directories were not created"
+            exit 0
+          fi
           # Generated headers, config option headers, mig output and the patched
           # source: enough to re-run any single compile command from the log locally.
           SDK=$(xcrun --sdk macosx --show-sdk-path)
@@ -124,12 +133,13 @@ jobs:
           tar czf buildtree.tgz \
             --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
             --exclude='kernel.development.*' --exclude='.git' \
-            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
-            -C .. sdk-kernel-platform
+            -C "$PWD/dxb" build/xnu.obj fakeroot/usr/local/include xnu \
+            -C "$PWD" sdk-kernel-platform
           ls -la buildtree.tgz
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.buildtree.outputs.ready == 'true'
         with:
           name: xnu-buildtree
           path: buildtree.tgz
@@ -140,6 +150,7 @@ jobs:
         run: |
           mkdir -p out/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            [ -f "$lib" ] || continue
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
@@ -148,16 +159,18 @@ jobs:
           ls -la out/kdk-libs
 
       - name: Collect
-        if: always()
         run: |
+          flavour=$(printf '%s' "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')
+          machine=$(printf '%s' "$MACHINE_CONFIG" | tr '[:upper:]' '[:lower:]')
+          kernel="kernel.$flavour.$machine"
+          test -s "dxb/fakeroot/System/Library/Kernels/$kernel"
           mkdir -p out
-          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS)
           ls -la out
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: xnu-kernel
           path: out/
-          if-no-files-found: warn
+          if-no-files-found: error
