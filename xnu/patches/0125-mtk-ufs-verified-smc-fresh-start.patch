@@ -1,0 +1,239 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -44,6 +44,7 @@
+ #define REG_UTRLCLR         0x5c
+ #define REG_UTRLRSR         0x60
+ #define REG_UTMRLBA         0x70
++#define REG_UTMRLDBR        0x78
+ #define REG_UTMRLBAU        0x74
+ #define REG_UTMRLRSR        0x80
+ #define REG_UICCMD          0x90
+@@ -65,6 +66,10 @@
+ #define IS_UIC_COMPLETE     (1u << 10)
+ #define IS_UIC_ERROR        (1u << 2)
+ #define IS_FATAL_MASK       (1u << 11) | (1u << 16) | (1u << 17) | (1u << 18)
++
++#define MTK_UFS_SMC64       0xc2000276u
++#define UFS_SIP_DEVICE_RESET 2u
++#define UFS_SIP_REFCLK       8u
+ 
+ #define UIC_DME_GET         0x01
+ #define UIC_DME_SET         0x02
+@@ -163,7 +168,7 @@
+ 	uint32_t secsize;
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+-	bool ready, writable;
++	bool ready, writable, fresh;
+ } su;
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+@@ -851,17 +856,183 @@
+ 	return 0;
+ }
+ 
++/* ABI verified against AD10 stock ufs-mediatek-mod.ko, not guessed from SiP IDs. */
++static uint64_t
++sweet_ufs_smc64(uint32_t command, uint32_t value)
++{
++	register uint64_t x0 __asm__("x0") = MTK_UFS_SMC64;
++	register uint64_t x1 __asm__("x1") = command;
++	register uint64_t x2 __asm__("x2") = value;
++	register uint64_t x3 __asm__("x3") = 0;
++	register uint64_t x4 __asm__("x4") = 0;
++	register uint64_t x5 __asm__("x5") = 0;
++	register uint64_t x6 __asm__("x6") = 0;
++	register uint64_t x7 __asm__("x7") = 0;
++	__asm__ volatile("dsb sy\nsmc #0\nisb"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
++	      "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++	    :
++	    : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++	      "x16", "x17", "memory", "cc");
++	return x0;
++}
++
++static int
++sweet_ufs_secure(uint32_t command, uint32_t value, char stage)
++{
++	uint64_t result = sweet_ufs_smc64(command, value);
++	UFS_MARK('S', stage, 'C', 'M', command);
++	UFS_MARK('S', stage, 'V', 'L', value);
++	UFS_MARK('S', stage, 'L', 'O', result);
++	UFS_MARK('S', stage, 'H', 'I', result >> 32);
++	return result == 0 ? 0 : EIO;
++}
++
++/* One bounded hardware-reset/startup experiment; never touch flash contents. */
++static int
++sweet_ufs_fresh_start(void)
++{
++	uint32_t result, value, hcs;
++	int error, release_error;
++
++	/* Do not abort an inherited outstanding transfer or task-management request. */
++	if (sweet_ufs_rd(REG_UTRLDBR) || sweet_ufs_rd(REG_UTMRLDBR)) {
++		return EBUSY;
++	}
++	sweet_ufs_ungate_clocks();
++	error = sweet_ufs_secure(UFS_SIP_REFCLK, 1u, '0');
++	if (error) {
++		return error;
++	}
++	error = sweet_ufs_refclk_enable();
++	if (error) {
++		return error;
++	}
++
++	sweet_ufs_wr(REG_IE, 0u);
++	sweet_ufs_wr(REG_AHIT, 0u);
++	sweet_ufs_wr(REG_UTRLRSR, 0u);
++	sweet_ufs_wr(REG_UTMRLRSR, 0u);
++	sweet_ufs_wr(REG_HCE, 0u);
++	for (unsigned int i = 0; i < 1000u && (sweet_ufs_rd(REG_HCE) & 1u); i++) {
++		sweet_ufs_delay_us(10);
++	}
++	if (sweet_ufs_rd(REG_HCE) & 1u) {
++		return ETIMEDOUT;
++	}
++
++	/* AD10 stock: RST_n low >=10us, high then >=10000us.
++	 * Always attempt release, even if assertion reports an error. */
++	error = sweet_ufs_secure(UFS_SIP_DEVICE_RESET, 0u, '1');
++	sweet_ufs_delay_us(10);
++	release_error = sweet_ufs_secure(UFS_SIP_DEVICE_RESET, 1u, '2');
++	sweet_ufs_delay_us(10000);
++	if (error || release_error) {
++		return error ? error : release_error;
++	}
++
++	/* AD10 DTS: HCI=pdn bit1, crypto=pdn bit0, UniPro=ao bit1.
++	 * ti,reset-bits flags 0x1c have STATUS_NONE: never read SET as status. */
++	sweet_ufs_wr32(su.pdn_cfg, 0x44, 1u << 1);
++	sweet_ufs_wr32(su.pdn_cfg, 0x44, 1u << 0);
++	sweet_ufs_wr32(su.ao_cfg, 0x44, 1u << 1);
++	sweet_ufs_delay_us(100);
++	sweet_ufs_wr32(su.ao_cfg, 0x48, 1u << 1);
++	sweet_ufs_wr32(su.pdn_cfg, 0x48, 1u << 0);
++	sweet_ufs_wr32(su.pdn_cfg, 0x48, 1u << 1);
++	/* No generic mPHY writes: AD10 ufshci does not bind the optional PHY. */
++	sweet_ufs_wr(REG_XOUFS, sweet_ufs_rd(REG_XOUFS) | 0x80u);
++	sweet_ufs_wr(REG_IE, 0u);
++	sweet_ufs_wr(REG_AHIT, 0u);
++	sweet_ufs_wr(REG_HCE, 1u);
++	sweet_ufs_delay_us(600);
++	for (unsigned int i = 0; i < 1000u; i++) {
++		if ((sweet_ufs_rd(REG_HCE) & 1u) &&
++		    (sweet_ufs_rd(REG_HCS) & HCS_UICRDY)) {
++			break;
++		}
++		sweet_ufs_delay_us(10);
++	}
++	if (!(sweet_ufs_rd(REG_HCE) & 1u) ||
++	    !(sweet_ufs_rd(REG_HCS) & HCS_UICRDY)) {
++		return ETIMEDOUT;
++	}
++	sweet_ufs_wr(REG_IS, sweet_ufs_rd(REG_IS));
++
++	/* The reference repeats startup once for an initially inactive device.
++	 * At most two passes, no retry or reset after a failed command. */
++	for (unsigned int pass = 0; pass < 2u; pass++) {
++		error = sweet_ufs_pre_link();
++		UFS_MARK('F', '0' + pass, 'P', 'R', error);
++		if (error) {
++			sweet_ufs_trace_link('F');
++			return error;
++		}
++		result = 0xffu;
++		value = 0;
++		error = sweet_ufs_uic(UIC_DME_LINK_STARTUP, 0u, &result, &value);
++		hcs = sweet_ufs_rd(REG_HCS);
++		UFS_MARK('F', '0' + pass, 'E', 'R', error);
++		UFS_MARK('F', '0' + pass, 'R', 'C', result);
++		UFS_MARK('F', '0' + pass, 'H', 'C', hcs);
++		if (error || result || !(hcs & HCS_DP)) {
++			sweet_ufs_trace_link('F');
++			return error ? error : (result ? EIO : ENXIO);
++		}
++	}
++	sweet_ufs_trace_link('F');
++	error = sweet_ufs_trace_pa_mode();
++	if (error) {
++		return error;
++	}
++
++	/* Same transfer-list ownership/readback gate as the legacy takeover. */
++	sweet_ufs_wr(REG_IE, 0u);
++	sweet_ufs_wr(REG_IS, sweet_ufs_rd(REG_IS));
++	sweet_ufs_wr(REG_UTRLRSR, 0u);
++	if (sweet_ufs_rd(REG_UTRLRSR) & 1u) {
++		return EIO;
++	}
++	if (sweet_ufs_rd(REG_UTRLDBR) != 0u) {
++		return EBUSY;
++	}
++	uint64_t list = su.dma_pa + DMA_UTRL;
++	sweet_ufs_wr(REG_UTRLBA, (uint32_t)list);
++	sweet_ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
++	sweet_ufs_wr(REG_UTRLRSR, 1u);
++	for (unsigned int i = 0; i < 1000u && !(sweet_ufs_rd(REG_HCS) & HCS_UTRLRDY); i++) {
++		sweet_ufs_delay_us(100);
++	}
++	error = sweet_ufs_check_utrl(list);
++	if (error) {
++		return error;
++	}
++	UFS_MARK('U', '0', '5', '1', list);
++	return 0;
++}
+ static int
+ sweet_ufs_take_over_host(void)
+ {
+ 	uint32_t result = 0xff, value = 0;
+ 	int error;
+-	int refclk = 1, recovery = 0, cold = 0, mphy_vendor = 0;
++	int refclk = 1, recovery = 0, cold = 0, mphy_vendor = 0, fresh = 1;
++	PE_parse_boot_argn("ufs_fresh", &fresh, sizeof(fresh));
+ 	PE_parse_boot_argn("ufs_refclk", &refclk, sizeof(refclk));
+ 	PE_parse_boot_argn("ufs_recovery", &recovery, sizeof(recovery));
+ 	PE_parse_boot_argn("ufs_cold", &cold, sizeof(cold));
+ 	PE_parse_boot_argn("ufs_mphy_vendor", &mphy_vendor, sizeof(mphy_vendor));
+ 	su.writable = false;
++	su.fresh = false;
++	if (fresh != 0 && fresh != 1) {
++		return EINVAL;
++	}
++	if (fresh) {
++		if (!refclk || recovery || cold || mphy_vendor) {
++			return EINVAL; /* Do not mix experiments or skip the clock prerequisite. */
++		}
++		su.fresh = true;
++		return sweet_ufs_fresh_start();
++	}
+ 
+ 	sweet_ufs_ungate_clocks();
+ 	if (mphy_vendor) {
+@@ -1211,12 +1382,18 @@
+ 		UFS_MARK('N', 'E', 'R', 'R', error);
+ 		if (!error) {
+ 			UFS_MARK('N', 'D', 'O', 'N', 1u);
+-			uint8_t tur[6] = { 0 };
+-			for (int i = 0; i < 8 &&
+-			    (error = sweet_ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+-				sweet_ufs_delay_us(2000);
++			if (su.fresh) {
++				/* Transport acceptance only. fDeviceInit must precede media reads. */
++				UFS_MARK('F', 'D', 'O', 'N', 1u);
++				error = ECANCELED;
++			} else {
++				uint8_t tur[6] = { 0 };
++				for (int i = 0; i < 8 &&
++				    (error = sweet_ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++					sweet_ufs_delay_us(2000);
++				}
++				UFS_MARK('U', '0', '5', '2', error);
+ 			}
+-			UFS_MARK('U', '0', '5', '2', error);
+ 		}
+ 	}
+ 	if (!error) {
