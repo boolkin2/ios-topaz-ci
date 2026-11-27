@@ -1,0 +1,32 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -351,12 +351,10 @@
+ 		return error;
+ 	}
+ 	printf("SWEET UFS: XO_BBCK3 before %08x\n", value);
++	/* Change mode and assert enable in one write: never select SW-off first. */
+ 	error = sweet_ufs_spmi_rmw(su.refclk_slave, su.refclk_reg,
+-	    MT6685_XO_BBCK3_MODE, 0, 0);
+-	if (!error) {
+-		error = sweet_ufs_spmi_rmw(su.refclk_slave, su.refclk_reg,
+-		    1u << su.refclk_en_bit, su.refclk_en_bit, 1);
+-	}
++	    MT6685_XO_BBCK3_MODE | (1u << su.refclk_en_bit), 0,
++	    1u << su.refclk_en_bit);
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -1170,7 +1168,12 @@
+ 		UFS_MARK('N', 'E', 'R', 'R', error);
+ 		if (!error) {
+ 			UFS_MARK('N', 'D', 'O', 'N', 1u);
+-			error = ECANCELED; /* Deliberately stop; no TUR or media request. */
++			uint8_t tur[6] = { 0 };
++			for (int i = 0; i < 8 &&
++			    (error = sweet_ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++				sweet_ufs_delay_us(2000);
++			}
++			UFS_MARK('U', '0', '5', '2', error);
+ 		}
+ 	}
+ 	if (!error) {

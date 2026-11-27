@@ -167,10 +167,13 @@ jobs:
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/
           (cd out && shasum -a 256 "$kernel" > SHA256SUMS)
+          mkdir -p kernel-artifact
+          cp "out/$kernel" out/SHA256SUMS kernel-artifact/
+          (cd kernel-artifact && shasum -a 256 -c SHA256SUMS)
           ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
           name: xnu-kernel
-          path: out/
+          path: kernel-artifact/
           if-no-files-found: error
