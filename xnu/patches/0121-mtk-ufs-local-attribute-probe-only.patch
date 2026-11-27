@@ -1,0 +1,82 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -75,6 +75,7 @@
+ #define UIC_DME_HIBER_EXIT  0x18
+ #define UIC_RESULT_MASK     0xffu
+ #define PA_PWRMODE          0x1571u
++#define PA_LOCALVERINFO     0x15a9u
+ #define PA_LOCAL_TX_LCC_ENABLE       0x155eu
+ #define VS_SAVEPOWERCONTROL          0xd0a6u
+ #define VS_UNIPROPOWERDOWNCONTROL    0xd0a8u
+@@ -802,6 +803,52 @@
+ 	UFS_MARK('M', 'P', 'L', stage, sweet_ufs_rd32(su.lk_phy, 0x208c));
+ }
+ 
++/* v235 diagnostic-only: do not issue a UPIU or take over either request list. */
++static int
++sweet_ufs_local_attr_probe(void)
++{
++	static const uint32_t attrs[] = {
++		VS_UNIPROPOWERDOWNCONTROL, PA_LOCAL_TX_LCC_ENABLE,
++		VS_SAVEPOWERCONTROL, PA_LOCALVERINFO
++	};
++	uint32_t status = sweet_ufs_rd(REG_IS);
++	uint32_t hcs = sweet_ufs_rd(REG_HCS);
++	int error = 0;
++	UFS_MARK('L', 'I', 'S', '0', status);
++	UFS_MARK('L', 'H', 'S', '0', hcs);
++	UFS_MARK('L', 'P', 'B', '0', sweet_ufs_read_link_probe());
++	/* These reads may clear latches. No earlier reads in the v235 path. */
++	UFS_MARK('L', 'P', 'A', '0', sweet_ufs_rd(REG_UECPA));
++	UFS_MARK('L', 'D', 'L', '0', sweet_ufs_rd(REG_UECDL));
++	if (status & (IS_UIC_COMPLETE | IS_UIC_ERROR | IS_FATAL_MASK)) {
++		error = EBUSY; /* Do not mistake a pending old event for our GET. */
++		goto out;
++	}
++	for (unsigned int i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
++		uint32_t result = 0xffu, value = 0;
++		if (!(sweet_ufs_rd(REG_HCS) & HCS_UICRDY)) {
++			error = ENXIO;
++			UFS_MARK('L', '0' + i, 'E', 'R', error);
++			break;
++		}
++		error = sweet_ufs_uic(UIC_DME_GET, attrs[i] << 16, &result, &value);
++		UFS_MARK('L', '0' + i, 'E', 'R', error);
++		UFS_MARK('L', '0' + i, 'R', 'C', result);
++		UFS_MARK('L', '0' + i, 'V', 'L', value);
++		if (error || result) {
++			error = error ? error : EIO;
++			break; /* No retry or next command after an error. */
++		}
++	}
++out:
++	UFS_MARK('L', 'P', 'B', '1', sweet_ufs_read_link_probe());
++	UFS_MARK('L', 'H', 'S', '1', sweet_ufs_rd(REG_HCS));
++	UFS_MARK('L', 'I', 'S', '1', sweet_ufs_rd(REG_IS));
++	UFS_MARK('L', 'D', 'O', 'N', error == 0);
++	/* ECANCELED is intentional diagnostic completion, not a UFS read result. */
++	return error ? error : ECANCELED;
++}
++
+ static int
+ sweet_ufs_take_over_host(void)
+ {
+@@ -835,14 +882,15 @@
+ 
+ 	uint32_t hce = sweet_ufs_rd(REG_HCE);
+ 	uint32_t hcs = sweet_ufs_rd(REG_HCS);
+-	printf("SWEET UFS: HCE %08x HCS %08x UECPA %08x UECDL %08x HW %08x\n",
+-	    hce, hcs, sweet_ufs_rd(REG_UECPA), sweet_ufs_rd(REG_UECDL),
+-	    sweet_ufs_rd(REG_MTK_HW_VER));
++	printf("SWEET UFS: HCE %08x HCS %08x HW %08x (local probe only)\n",
++	    hce, hcs, sweet_ufs_rd(REG_MTK_HW_VER));
+ 	UFS_MARK('U', '0', '3', '0', hce);
+ 	UFS_MARK('U', '0', '3', '1', hcs);
+ 	if (!(hce & 1u) || !(hcs & HCS_UICRDY)) {
+ 		return ENXIO;
+ 	}
++
++	return sweet_ufs_local_attr_probe();
+ 
+ 	sweet_ufs_trace_link('0');
+ 	error = sweet_ufs_uic(UIC_DME_PEER_GET, PA_PWRMODE << 16, &result, &value);
