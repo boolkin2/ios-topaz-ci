@@ -1,0 +1,64 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -512,6 +512,17 @@
+ 	return 0;
+ }
+ 
++/* Keep pmsg output outside the samples immediately around the doorbell. */
++static void
++sweet_ufs_tur_trace(uint32_t hcs_before, uint32_t is_before,
++    uint32_t is_after, uint32_t hcs_after)
++{
++	UFS_MARK('T', 'B', 'H', 'C', hcs_before);
++	UFS_MARK('T', 'B', 'I', 'S', is_before);
++	UFS_MARK('T', 'A', 'I', 'S', is_after);
++	UFS_MARK('T', 'A', 'H', 'C', hcs_after);
++}
++
+ static int
+ sweet_ufs_scsi(const uint8_t *cdb, unsigned int cdb_len, uint32_t len, bool write)
+ {
+@@ -520,6 +531,8 @@
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
+ 	uint64_t bounce_pa = su.dma_pa + DMA_BOUNCE;
+ 	uint32_t is = 0;
++	uint32_t hcs_before = 0, is_before = 0;
++	bool trace_tur = cdb_len == 6 && cdb[0] == 0x00;
+ 	int list_error;
+ 
+ 	if (write) {
+@@ -571,6 +584,10 @@
+ 		UFS_MARK('U', '0', '5', '4', list_error);
+ 		return list_error;
+ 	}
++	if (trace_tur) {
++		hcs_before = sweet_ufs_rd(REG_HCS);
++		is_before = sweet_ufs_rd(REG_IS);
++	}
+ 	sweet_ufs_wr(REG_UTRLDBR, 1u);
+ 
+ 	uint64_t deadline;
+@@ -582,15 +599,23 @@
+ 			break;
+ 		}
+ 		if (mach_absolute_time() > deadline) {
++			uint32_t hcs_after = trace_tur ? sweet_ufs_rd(REG_HCS) : 0;
+ 			sweet_ufs_wr(REG_UTRLCLR, ~1u);
+ 			sweet_ufs_wr(REG_IS, sweet_ufs_rd(REG_IS));
++			if (trace_tur) {
++				sweet_ufs_tur_trace(hcs_before, is_before, is, hcs_after);
++			}
+ 			printf("SWEET UFS: command %02x timeout, HCS %08x IS %08x\n",
+ 			    cdb[0], sweet_ufs_rd(REG_HCS), is);
+ 			return ETIMEDOUT;
+ 		}
+ 		sweet_ufs_delay_us(10);
+ 	}
++	uint32_t hcs_after = trace_tur ? sweet_ufs_rd(REG_HCS) : 0;
+ 	sweet_ufs_wr(REG_IS, is);
++	if (trace_tur) {
++		sweet_ufs_tur_trace(hcs_before, is_before, is, hcs_after);
++	}
+ 	sweet_ufs_dma_sync(DMA_UTRL, sizeof(*utrd));
+ 	sweet_ufs_dma_sync(DMA_UCD, sizeof(*ucd));
+ 	if (len) {
