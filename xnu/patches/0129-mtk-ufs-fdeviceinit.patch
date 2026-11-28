@@ -1,0 +1,148 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index dfa0c28..43cdee6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -135,6 +135,15 @@ extern void sweet_late_mark(unsigned int tag, unsigned int val);
+ #define UIC_TIMEOUT_NS       (1ull * NSEC_PER_SEC)
+ #define SPMI_TIMEOUT_NS      (100ull * NSEC_PER_MSEC)
+ 
++#define UPIU_TRANSACTION_QUERY_REQ              0x16u
++#define UPIU_QUERY_OPCODE_READ_FLAG             0x05u
++#define UPIU_QUERY_OPCODE_SET_FLAG              0x06u
++#define UPIU_QUERY_FUNC_STANDARD_READ_REQUEST   0x01u
++#define UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST  0x81u
++#define QUERY_FLAG_IDN_FDEVICEINIT              0x01u
++#define FDEVICEINIT_POLL_US                     5000u
++#define FDEVICEINIT_POLL_COUNT                  300u
++
+ #define DMA_UTRL             0x0000
+ #define DMA_UCD              0x1000
+ #define DMA_BOUNCE           0x4000
+@@ -798,6 +807,87 @@ sweet_ufs_scsi(const uint8_t *cdb, unsigned int cdb_len, uint32_t len, bool writ
+ 	return 0;
+ }
+ 
++/* UFS QUERY REQUEST for the fDeviceInit device flag.  Vendor ufshcd sends
++ * SET FLAG and then polls READ FLAG until the device clears it; this host
++ * issues the same two standard requests, one attempt, no retry storm, and
++ * stops instead of touching media when the flag is not accepted. */
++static int
++sweet_ufs_query_flag(uint8_t opcode, bool *flag)
++{
++	struct sweet_ufs_utrd *utrd = (struct sweet_ufs_utrd *)(su.dma + DMA_UTRL);
++	struct sweet_ufs_ucd *ucd = (struct sweet_ufs_ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++	uint32_t is = 0;
++	int list_error;
++
++	list_error = sweet_ufs_check_utrl(su.dma_pa + DMA_UTRL);
++	if (list_error) {
++		UFS_MARK('U', '0', '5', '4', list_error);
++		return list_error;
++	}
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++	ucd->cmd[0] = UPIU_TRANSACTION_QUERY_REQ;
++	ucd->cmd[1] = 0;
++	ucd->cmd[2] = 0;	/* device management request: LUN 0 */
++	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[5] = opcode == UPIU_QUERY_OPCODE_READ_FLAG ?
++	    UPIU_QUERY_FUNC_STANDARD_READ_REQUEST :
++	    UPIU_QUERY_FUNC_STANDARD_WRITE_REQUEST;
++	ucd->cmd[12] = opcode;
++	ucd->cmd[13] = QUERY_FLAG_IDN_FDEVICEINIT;
++	ucd->cmd[14] = 0;	/* index */
++	ucd->cmd[15] = 0;	/* selector */
++
++	utrd->dw0 = (1u << 24) | (1u << 28);
++	utrd->dw2 = 0x0f;
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4u) << 16 | (512u / 4u);
++
++	sweet_ufs_dma_sync(DMA_UTRL, sizeof(*utrd));
++	sweet_ufs_dma_sync(DMA_UCD, sizeof(*ucd));
++	list_error = sweet_ufs_check_utrl(su.dma_pa + DMA_UTRL);
++	if (list_error) {
++		UFS_MARK('U', '0', '5', '4', list_error);
++		return list_error;
++	}
++	sweet_ufs_wr(REG_UTRLDBR, 1u);
++
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (!(is & (IS_UTP_COMPLETE | IS_UIC_ERROR | IS_FATAL_MASK))) {
++		is = sweet_ufs_rd(REG_IS);
++		if (is & (IS_UTP_COMPLETE | IS_UIC_ERROR | IS_FATAL_MASK)) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			sweet_ufs_wr(REG_UTRLCLR, ~1u);
++			sweet_ufs_wr(REG_IS, sweet_ufs_rd(REG_IS));
++			return ETIMEDOUT;
++		}
++		sweet_ufs_delay_us(10);
++	}
++	sweet_ufs_wr(REG_IS, is);
++	sweet_ufs_dma_sync(DMA_UTRL, sizeof(*utrd));
++	sweet_ufs_dma_sync(DMA_UCD, sizeof(*ucd));
++
++	uint32_t ocs = utrd->dw2 & 0x0f;
++	if (!(is & IS_UTP_COMPLETE) || ocs || ucd->resp[0] != 0x36u ||
++	    ucd->resp[6] || ucd->resp[7]) {
++		UFS_MARK('F', 'D', 'E', 'R', is);
++		UFS_MARK('F', 'D', 'O', 'C', ocs);
++		UFS_MARK('F', 'D', 'R', 'S', ((uint32_t)ucd->resp[6] << 8) | ucd->resp[7]);
++		return EIO;
++	}
++	if (flag) {
++		/* Query response value is big-endian at bytes 20..23. */
++		*flag = (ucd->resp[23] & 1u) != 0;
++	}
++	return 0;
++}
++
+ static int
+ sweet_ufs_transfer_blocks(uint64_t lba, uint32_t count, bool write)
+ {
+@@ -815,7 +905,7 @@ sweet_ufs_transfer_blocks(uint64_t lba, uint32_t count, bool write)
+ static int
+ sweet_ufs_read_capacity(void)
+ {
+-	uint8_t cdb[10] = { 0x25 };
++	uint8_t cdb[10] = { 0x25, 0, 0, 0, 0, 0, 0, 0, 0x08, 0 };
+ 	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = sweet_ufs_scsi(cdb, sizeof(cdb), 8, false);
+ 	if (error) {
+@@ -1497,9 +1587,27 @@ sweet_ufs_init(void)
+ 		if (!error) {
+ 			UFS_MARK('N', 'D', 'O', 'N', 1u);
+ 			if (su.fresh) {
+-				/* Transport acceptance only. fDeviceInit must precede media reads. */
+-				UFS_MARK('F', 'D', 'O', 'N', 1u);
+-				error = ECANCELED;
++				bool flag = true;
++				/* fDeviceInit must complete before any media access. */
++				error = sweet_ufs_query_flag(UPIU_QUERY_OPCODE_SET_FLAG, NULL);
++				UFS_MARK('F', 'D', 'S', 'T', error);
++				if (!error) {
++					for (unsigned int i = 0; i < FDEVICEINIT_POLL_COUNT; i++) {
++						error = sweet_ufs_query_flag(UPIU_QUERY_OPCODE_READ_FLAG, &flag);
++						if (error || !flag) {
++							break;
++						}
++						sweet_ufs_delay_us(FDEVICEINIT_POLL_US);
++					}
++				}
++				UFS_MARK('F', 'D', 'R', 'D', error);
++				UFS_MARK('F', 'D', 'V', 'L', flag ? 1u : 0u);
++				if (!error && flag) {
++					error = ETIMEDOUT;
++				}
++				if (!error) {
++					UFS_MARK('F', 'D', 'O', 'N', 1u);
++				}
+ 			} else {
+ 				uint8_t tur[6] = { 0 };
+ 				for (int i = 0; i < 8 &&
