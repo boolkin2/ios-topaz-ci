@@ -1,0 +1,157 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -435,25 +435,58 @@
+ 	return 0;
+ }
+ 
+-/* Snapshot each ROC latch once before W1C. Only this precise startup event
+- * may precede UIC_COMMAND_COMPL; it is not proof that the link came up. */
++/* Sample every ROC latch once, before W1C, and classify a LINK_STARTUP UIC
++ * error as the isolated local PA LINERESET. That event may precede
++ * UIC_COMMAND_COMPL, but it is not proof that the link came up. Sampling and
++ * logging are separate so a storm of indications cannot flood pmsg. */
++struct sweet_ufs_link_snapshot {
++	uint32_t status;
++	uint32_t pa;
++	uint32_t dl;
++	uint32_t nl;
++	uint32_t tl;
++	uint32_t dme;
++};
++
+ static bool
+-sweet_ufs_link_reset_event(uint32_t status)
+-{
+-	uint32_t pa = sweet_ufs_rd(REG_UECPA);
+-	uint32_t dl = sweet_ufs_rd(REG_UECDL);
+-	uint32_t nl = sweet_ufs_rd(REG_UECN);
+-	uint32_t tl = sweet_ufs_rd(REG_UECT);
+-	uint32_t dme = sweet_ufs_rd(REG_UECDME);
+-
+-	UFS_MARK('L', 'I', 'S', 'R', status);
+-	UFS_MARK('L', 'P', 'A', 'R', pa);
+-	UFS_MARK('L', 'D', 'L', 'R', dl);
+-	UFS_MARK('L', 'N', 'L', 'R', nl);
+-	UFS_MARK('L', 'T', 'L', 'R', tl);
+-	UFS_MARK('L', 'D', 'M', 'R', dme);
+-	return pa == 0x80000010u &&
+-	       !((dl | nl | tl | dme) & 0x80000000u);
++sweet_ufs_link_sample(uint32_t status, struct sweet_ufs_link_snapshot *sample)
++{
++	sample->status = status;
++	sample->pa = sweet_ufs_rd(REG_UECPA);
++	sample->dl = sweet_ufs_rd(REG_UECDL);
++	sample->nl = sweet_ufs_rd(REG_UECN);
++	sample->tl = sweet_ufs_rd(REG_UECT);
++	sample->dme = sweet_ufs_rd(REG_UECDME);
++	return sample->pa == 0x80000010u &&
++	    !((sample->dl | sample->nl | sample->tl | sample->dme) & 0x80000000u);
++}
++
++static bool
++sweet_ufs_link_same(const struct sweet_ufs_link_snapshot *a,
++    const struct sweet_ufs_link_snapshot *b)
++{
++	return a->status == b->status && a->pa == b->pa && a->dl == b->dl &&
++	    a->nl == b->nl && a->tl == b->tl && a->dme == b->dme;
++}
++
++/* LISR is the raw pre-W1C sample; completion/timeout log the post-W1C status. */
++static void
++sweet_ufs_link_log(const struct sweet_ufs_link_snapshot *sample)
++{
++	UFS_MARK('L', 'I', 'S', 'R', sample->status);
++	UFS_MARK('L', 'P', 'A', 'R', sample->pa);
++	UFS_MARK('L', 'D', 'L', 'R', sample->dl);
++	UFS_MARK('L', 'N', 'L', 'R', sample->nl);
++	UFS_MARK('L', 'T', 'L', 'R', sample->tl);
++	UFS_MARK('L', 'D', 'M', 'R', sample->dme);
++}
++
++/* Bounded diagnostics: one first snapshot, one last snapshot and totals. */
++static void
++sweet_ufs_link_count(uint32_t events, uint32_t repeats)
++{
++	UFS_MARK('L', 'T', 'O', 'T', events);
++	UFS_MARK('L', 'R', 'E', 'P', repeats);
+ }
+ 
+ static int
+@@ -463,7 +496,10 @@
+ 	uint64_t deadline;
+ 	uint32_t status = 0;
+ 	bool link_startup = opcode == UIC_DME_LINK_STARTUP;
+-	bool link_reset_seen = false;
++	struct sweet_ufs_link_snapshot link_last = { 0, 0, 0, 0, 0, 0 };
++	struct sweet_ufs_link_snapshot link_now;
++	uint32_t link_events = 0;
++	uint32_t link_repeats = 0;
+ 
+ 	sweet_ufs_wr(REG_UICARG1, arg1);
+ 	sweet_ufs_wr(REG_UICARG2, 0u);
+@@ -476,32 +512,47 @@
+ 		if (link_startup) {
+ 			if (status & (IS_FATAL_MASK)) {
+ 				if (status & IS_UIC_ERROR) {
+-					(void)sweet_ufs_link_reset_event(status);
++					(void)sweet_ufs_link_sample(status, &link_now);
++					sweet_ufs_link_log(&link_now);
+ 				} else {
+ 					UFS_MARK('L', 'I', 'S', 'R', status);
+ 				}
++				sweet_ufs_link_count(link_events, link_repeats);
+ 				sweet_ufs_wr(REG_IS, status);
+ 				*result = 0xffu;
+ 				*value = 0;
+ 				return EIO; /* Fatal wins even if completion is also set. */
+ 			}
+ 			if (status & IS_UIC_ERROR) {
+-				bool reset_only = sweet_ufs_link_reset_event(status);
+-				if (!reset_only || link_reset_seen) {
+-					UFS_MARK('L', 'R', 'S', 'T', reset_only ? 2u : 0u);
++				if (!sweet_ufs_link_sample(status, &link_now)) {
++					sweet_ufs_link_log(&link_now);
++					UFS_MARK('L', 'R', 'S', 'T', 0u);
++					sweet_ufs_link_count(link_events + 1u, link_repeats);
+ 					sweet_ufs_wr(REG_IS, status);
+ 					*result = 0xffu;
+ 					*value = 0;
+ 					return EIO;
+ 				}
+-				link_reset_seen = true;
+-				UFS_MARK('L', 'R', 'S', 'T', 1u);
+-				/* Do not acknowledge a not-yet-observed command completion. */
++				if (link_events == 0) {
++					sweet_ufs_link_log(&link_now);
++					UFS_MARK('L', 'R', 'S', 'T', 1u);
++				} else if (sweet_ufs_link_same(&link_now, &link_last)) {
++					link_repeats++;
++				}
++				link_last = link_now;
++				link_events++;
++				/* Acknowledge only this error; keep an unseen completion. */
+ 				sweet_ufs_wr(REG_IS, IS_UIC_ERROR);
+ 				status &= ~IS_UIC_ERROR;
+ 			}
+ 			if (status & IS_UIC_COMPLETE) {
+ 				UFS_MARK('L', 'C', 'I', 'S', status);
++				if (link_events != 0) {
++					if (link_events > 1) {
++						sweet_ufs_link_log(&link_last);
++					}
++					sweet_ufs_link_count(link_events, link_repeats);
++				}
+ 			}
+ 		}
+ 		if (status & (IS_UIC_COMPLETE | IS_UIC_ERROR | IS_FATAL_MASK)) {
+@@ -512,6 +563,10 @@
+ 		}
+ 		if (mach_absolute_time() > deadline) {
+ 			if (link_startup) {
++				if (link_events > 1) {
++					sweet_ufs_link_log(&link_last);
++				}
++				sweet_ufs_link_count(link_events, link_repeats);
+ 				UFS_MARK('L', 'T', 'I', 'S', status);
+ 				UFS_MARK('L', 'T', 'H', 'C', sweet_ufs_rd(REG_HCS));
+ 			}
