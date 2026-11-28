@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 0000000..0000000 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -149,6 +149,9 @@
+ #define UFS_SENSE_KEY_UNIT_ATTENTION            0x06u
+ #define UFS_UA_RETRY_DELAY_US                   10000u
+ 
++#define UFS_MAX_LUNS                            8u
++#define UFS_GPT_LBA                             1u
++
+ #define DMA_UTRL             0x0000
+ #define DMA_UCD              0x1000
+ #define DMA_BOUNCE           0x4000
+@@ -669,6 +672,7 @@
+ static uint8_t su_sense_asc;
+ static uint8_t su_sense_ascq;
+ static uint32_t su_sense_len;
++static bool su_scanning;
+ 
+ static void
+ sweet_ufs_sense_snapshot(void)
+@@ -835,11 +839,13 @@
+ 	    ucd->resp[0] != (cdb_len ? 0x21u : 0x20u) || ucd->resp[6] || ucd->resp[7] ||
+ 	    (cdb_len == 0 && ((is & (IS_UIC_ERROR | IS_FATAL_MASK)) ||
+ 	    nop_dbr != 0 || ucd->resp[3] != ucd->cmd[3]))) {
+-		printf("SWEET UFS: command %02x failed: IS %08x OCS %x RSP %02x status %02x/%02x HCS %08x\n",
+-		    cdb[0], is, ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7], sweet_ufs_rd(REG_HCS));
+-		if (cdb_len) {
+-			printf("SWEET UFS: sense len %u key %02x ASC %02x/%02x\n",
+-			    su_sense_len, su_sense_key, su_sense_asc, su_sense_ascq);
++		if (!su_scanning) {
++			printf("SWEET UFS: command %02x failed: IS %08x OCS %x RSP %02x status %02x/%02x HCS %08x\n",
++			    cdb[0], is, ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7], sweet_ufs_rd(REG_HCS));
++			if (cdb_len) {
++				printf("SWEET UFS: sense len %u key %02x ASC %02x/%02x\n",
++				    su_sense_len, su_sense_key, su_sense_asc, su_sense_ascq);
++			}
+ 		}
+ 		return EIO;
+ 	}
+@@ -1040,6 +1046,39 @@
+ 	return ENOENT;
+ }
+ 
++/* Android keeps the boot LUNs (0 and 1) small and the GPT on the next LUN.
++ * Probe the fixed UFS LUN range, accept the first LUN whose LBA 1 carries a
++ * GPT signature, and keep that capacity for the partition lookup. */
++static int
++sweet_ufs_select_lun(void)
++{
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++
++	for (uint32_t lun = 0; lun < UFS_MAX_LUNS; lun++) {
++		int error;
++
++		su.lun = (uint8_t)lun;
++		su_scanning = true;
++		error = sweet_ufs_read_capacity();
++		if (!error && su.device_blocks > UFS_GPT_LBA) {
++			error = sweet_ufs_transfer_blocks(UFS_GPT_LBA, 1, false);
++		}
++		su_scanning = false;
++		if (error) {
++			continue;
++		}
++		if (memcmp(b, "EFI PART", 8) != 0) {
++			continue;
++		}
++		UFS_MARK('U', '0', '8', '0', lun);
++		printf("SWEET UFS: GPT on LUN %u, %llu blocks x %u bytes\n",
++		    lun, su.device_blocks, su.block_size);
++		return 0;
++	}
++	printf("SWEET UFS: no GPT on LUNs 0..%u\n", UFS_MAX_LUNS - 1u);
++	return ENXIO;
++}
++
+ /* Read vendor link state, restoring the debug mux rather than changing PHY. */
+ static uint32_t
+ sweet_ufs_read_link_probe(void)
+@@ -1676,9 +1715,12 @@
+ 		}
+ 	}
+ 	if (!error) {
+-		error = sweet_ufs_read_capacity();
+-		UFS_MARK('U', '0', '6', '1', error);
+-		UFS_MARK('U', '0', '6', '0', su.block_size);
++		error = sweet_ufs_select_lun();
++		UFS_MARK('U', '0', '6', '2', error);
++		if (!error) {
++			UFS_MARK('U', '0', '6', '1', 0u);
++			UFS_MARK('U', '0', '6', '0', su.block_size);
++		}
+ 	}
+ 	if (!error) {
+ 		error = sweet_ufs_find_partition(want);
