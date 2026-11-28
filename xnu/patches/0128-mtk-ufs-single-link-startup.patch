@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index f70441f..dfa0c28 100755
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1072,26 +1072,27 @@ sweet_ufs_fresh_start(void)
+ 	}
+ 	sweet_ufs_wr(REG_IS, sweet_ufs_rd(REG_IS));
+ 
+-	/* The reference repeats startup once for an initially inactive device.
+-	 * At most two passes, no retry or reset after a failed command. */
+-	for (unsigned int pass = 0; pass < 2u; pass++) {
+-		error = sweet_ufs_pre_link();
+-		UFS_MARK('F', '0' + pass, 'P', 'R', error);
+-		if (error) {
+-			sweet_ufs_trace_link('F');
+-			return error;
+-		}
+-		result = 0xffu;
+-		value = 0;
+-		error = sweet_ufs_uic(UIC_DME_LINK_STARTUP, 0u, &result, &value);
+-		hcs = sweet_ufs_rd(REG_HCS);
+-		UFS_MARK('F', '0' + pass, 'E', 'R', error);
+-		UFS_MARK('F', '0' + pass, 'R', 'C', result);
+-		UFS_MARK('F', '0' + pass, 'H', 'C', hcs);
+-		if (error || result || !(hcs & HCS_DP)) {
+-			sweet_ufs_trace_link('F');
+-			return error ? error : (result ? EIO : ENXIO);
+-		}
++	/* One startup pass. v241 pmsg on AD10: the first LINK_STARTUP completes
++	 * with result 0 and HCS.DP set, while an unconditional second startup is
++	 * rejected with result 1 even though DP stays set. Do not issue that
++	 * second call; a failed command still returns here, with no retry or
++	 * reset after it. */
++	error = sweet_ufs_pre_link();
++	UFS_MARK('F', '0', 'P', 'R', error);
++	if (error) {
++		sweet_ufs_trace_link('F');
++		return error;
++	}
++	result = 0xffu;
++	value = 0;
++	error = sweet_ufs_uic(UIC_DME_LINK_STARTUP, 0u, &result, &value);
++	hcs = sweet_ufs_rd(REG_HCS);
++	UFS_MARK('F', '0', 'E', 'R', error);
++	UFS_MARK('F', '0', 'R', 'C', result);
++	UFS_MARK('F', '0', 'H', 'C', hcs);
++	if (error || result || !(hcs & HCS_DP)) {
++		sweet_ufs_trace_link('F');
++		return error ? error : (result ? EIO : ENXIO);
+ 	}
+ 	sweet_ufs_trace_link('F');
+ 	error = sweet_ufs_trace_pa_mode();
